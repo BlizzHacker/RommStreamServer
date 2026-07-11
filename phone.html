@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>RomM Controller</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;touch-action:manipulation}
+body{background:#0B1020;color:#fff;font-family:Arial;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;user-select:none}
+h2{color:#7DD3FC;margin-bottom:8px}
+#status{color:#9FB3D9;font-size:14px;margin-bottom:12px;text-align:center}
+#dpad{display:grid;grid-template-columns:80px 80px 80px;grid-template-rows:80px 80px 80px;gap:4px;margin-top:10px}
+.btn{background:#1E2D50;border:2px solid #334B7A;border-radius:12px;font-size:28px;color:#F8FAFC;display:flex;align-items:center;justify-content:center;cursor:pointer;-webkit-user-select:none}
+.btn:active,.btn.active{background:#7DD3FC;color:#0B1020}
+#btn-up{grid-column:2;grid-row:1}
+#btn-left{grid-column:1;grid-row:2}
+#btn-center{grid-column:2;grid-row:2;font-size:12px}
+#btn-right{grid-column:3;grid-row:2}
+#btn-down{grid-column:2;grid-row:3}
+#actions{display:flex;gap:12px;margin-top:12px;flex-wrap:wrap;justify-content:center}
+.abtn{width:66px;height:66px;border-radius:50%;font-size:16px}
+</style></head><body>
+<h2>RomM Controller</h2>
+<div id="status">Searching for active stream...</div>
+<div id="dpad">
+<button class="btn" id="btn-up"    onpointerdown="send('up',true)" onpointerup="send('up',false)" onpointerleave="send('up',false)">&uarr;</button>
+<button class="btn" id="btn-left"  onpointerdown="send('left',true)" onpointerup="send('left',false)" onpointerleave="send('left',false)">&larr;</button>
+<button class="btn" id="btn-center">MOVE</button>
+<button class="btn" id="btn-right" onpointerdown="send('right',true)" onpointerup="send('right',false)" onpointerleave="send('right',false)">&rarr;</button>
+<button class="btn" id="btn-down"  onpointerdown="send('down',true)" onpointerup="send('down',false)" onpointerleave="send('down',false)">&darr;</button>
+</div>
+<div id="actions">
+<button class="btn abtn" onpointerdown="send('a',true)" onpointerup="send('a',false)" onpointerleave="send('a',false)">A</button>
+<button class="btn abtn" onpointerdown="send('b',true)" onpointerup="send('b',false)" onpointerleave="send('b',false)">B</button>
+<button class="btn abtn" onpointerdown="send('start',true)" onpointerup="send('start',false)" onpointerleave="send('start',false)">START</button>
+<button class="btn abtn" onpointerdown="send('select',true)" onpointerup="send('select',false)" onpointerleave="send('select',false)">SEL</button>
+</div>
+<script>
+let sid='',connected=false;
+let pollTimer=null;
+
+function connect(id){
+sid=id;connected=true;
+document.getElementById('status').textContent='Connected: '+sid;
+if(pollTimer){clearInterval(pollTimer);pollTimer=null}
+}
+
+function disconnect(){
+connected=false;sid='';
+document.getElementById('status').textContent='Disconnected — searching...';
+pollStreams();
+}
+
+async function pollStreams(){
+try{
+let r=await fetch('/api/stream/status');
+let d=await r.json();
+let streams=d.streams||[];
+if(streams.length>0&&!connected){
+connect(streams[0].id||streams[0]);
+}else if(streams.length===0&&connected){
+disconnect();
+}
+}catch(e){}
+}
+
+function send(key,pressed){
+if(!connected||!sid)return
+fetch('/api/stream/'+sid+'/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key,pressed:pressed})}).catch(()=>{})
+}
+
+// Check URL param first
+(function(){
+let p=new URLSearchParams(location.search);
+let s=p.get('sid');
+if(s){connect(s);return}
+pollStreams();
+pollTimer=setInterval(pollStreams,3000);
+})();
+</script></body></html>

@@ -86,6 +86,17 @@ async def handle_start(req):
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, env=env)
     await asyncio.sleep(4)
 
+    # Discover CDP page websocket URL
+    cdp_ws = ''
+    try:
+        from urllib.request import urlopen
+        cdp_resp = urlopen('http://localhost:' + str(debug_port) + '/json', timeout=5)
+        pages = json.loads(cdp_resp.read())
+        if pages:
+            cdp_ws = pages[0].get('webSocketDebuggerUrl', '')
+    except Exception:
+        pass
+
     hls_path = str(stream_dir / 'stream.m3u8')
     seg_pattern = str(stream_dir / 'seg_%03d.ts')
     ffmpeg = await asyncio.create_subprocess_exec(
@@ -103,7 +114,8 @@ async def handle_start(req):
 
     STREAMS[sid] = {
         'xvfb': xvfb, 'chrome': chrome, 'ffmpeg': ffmpeg,
-        'display': display, 'debug_port': debug_port, 'rom_name': rom_name
+        'display': display, 'debug_port': debug_port, 'rom_name': rom_name,
+        'cdp_ws': cdp_ws
     }
     hls_url = 'http://192.168.0.94:8091/hls/' + sid + '/stream.m3u8'
     return web.json_response({'stream_id': sid, 'hls_url': hls_url, 'debug_port': debug_port})
@@ -134,15 +146,17 @@ async def handle_input(req):
 
     mapped = KEY_MAP.get(key, key)
     try:
-        ws_url = 'ws://localhost:' + str(s['debug_port']) + '/devtools/page/0'
-        page_ws = websocket.create_connection(ws_url, timeout=2)
-        method = 'Input.dispatchKeyEvent'
-        params = {
-            'type': 'keyDown' if pressed else 'keyUp',
-            'key': mapped, 'code': mapped, 'windowsVirtualKeyCode': 0
-        }
-        page_ws.send(json.dumps({'id': 1, 'method': method, 'params': params}))
-        page_ws.close()
+        ws_url = s.get('cdp_ws', '')
+        if ws_url:
+            ws_url = ws_url.replace('localhost', '127.0.0.1')
+            page_ws = websocket.create_connection(ws_url, timeout=2)
+            method = 'Input.dispatchKeyEvent'
+            params = {
+                'type': 'keyDown' if pressed else 'keyUp',
+                'key': mapped, 'code': mapped, 'windowsVirtualKeyCode': 0
+            }
+            page_ws.send(json.dumps({'id': 1, 'method': method, 'params': params}))
+            page_ws.close()
     except Exception:
         pass
     return web.json_response({'ok': True, 'key': key, 'mapped': mapped})

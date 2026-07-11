@@ -82,7 +82,7 @@ async def handle_start(req):
         '--enable-webgl', '--ignore-gpu-blocklist',
         '--window-size=1280,720', '--start-fullscreen',
         '--remote-debugging-port=' + str(debug_port),
-        'file://' + str(stream_dir) + '/player.html',
+        'http://192.168.0.94:8091/player/' + sid + '/player.html',
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, env=env)
     await asyncio.sleep(4)
 

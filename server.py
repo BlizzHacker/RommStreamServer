@@ -180,7 +180,20 @@ async def handle_start(req):
     platform = data.get('platform', 'n64')
     rom_name = data.get('rom_name', '')
     web_url = data.get('url', '')
+    client = data.get('client', '')
     display_name = data.get('name', rom_name or 'game')
+
+    # Reap prior sessions from the same client (e.g. a Roku relaunch) so they
+    # don't pile up as orphan Chromium/FFmpeg processes and confuse which
+    # session is live. A client only ever needs one active stream.
+    if client:
+        for old_sid in [k for k, v in STREAMS.items() if v.get('client') == client]:
+            old = STREAMS.pop(old_sid, None)
+            if old:
+                await runner_retroarch.terminate(
+                    old.get('ffmpeg'), old.get('chrome'),
+                    old.get('retroarch'), old.get('xvfb'))
+                ALLOC.release(old['display_num'])
 
     rom = None
     if web_url:
@@ -224,12 +237,21 @@ async def handle_start(req):
                     .replace('__CORE__', core).replace('__ROM_URL__', rom_url))
             (stream_dir / 'player.html').write_text(html)
             page_url = f'{PUBLIC_BASE}/player/{sid}/player.html'
+        # Fresh throwaway profile per session + crash flags kill the
+        # "Chromium didn't shut down correctly / Restore pages?" infobar that
+        # appears when a prior session's profile was left dirty.
+        profile_dir = str(stream_dir / 'chrome-profile')
         chrome = await asyncio.create_subprocess_exec(
             'chromium', '--display=' + display, '--no-sandbox',
             '--disable-gpu-sandbox', '--use-gl=angle',
             '--use-angle=swiftshader', '--enable-webgl',
             '--ignore-gpu-blocklist', '--window-size=1280,720',
-            '--start-fullscreen',
+            '--start-fullscreen', '--kiosk',
+            '--user-data-dir=' + profile_dir,
+            '--no-first-run', '--no-default-browser-check',
+            '--disable-session-crashed-bubble',
+            '--disable-infobars', '--hide-crash-restore-bubble',
+            '--disable-features=InfiniteSessionRestore,Translate',
             '--remote-debugging-port=' + str(debug_port),
             # Chromium >=111 rejects CDP WebSocket connections (403) unless the
             # origin is allowlisted; without this every controller keypress
@@ -263,7 +285,7 @@ async def handle_start(req):
     STREAMS[sid] = {'xvfb': xvfb, 'chrome': chrome, 'retroarch': ra,
                     'ffmpeg': ffmpeg, 'display_num': display_num,
                     'engine': engine, 'rom_name': display_name,
-                    'cdp_ws': cdp_ws, 'web': bool(web_url)}
+                    'cdp_ws': cdp_ws, 'web': bool(web_url), 'client': client}
     # Point clients at the master playlist (Roku requires #EXT-X-STREAM-INF).
     # RetroArch/HLS-only sessions without a master fall back to the media list.
     return web.json_response({

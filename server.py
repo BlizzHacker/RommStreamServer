@@ -1,14 +1,40 @@
 #!/usr/bin/env python3
-"""RomM Streaming Server — EmulatorJS + FFmpeg → HLS for Roku."""
+"""RomM Streaming Server.
 
-import asyncio, json, os, uuid, urllib.parse
+Two play paths, one backend:
+  - Roku (legacy):   Chromium+EmulatorJS or RetroArch on Xvfb → FFmpeg → HLS,
+                     input relayed via CDP (Chromium) or xdotool (RetroArch).
+  - Xbox (WebRTC):   RetroArch on Xvfb → aiortc H.264/Opus, input over the
+                     WebRTC data channel. ~100 ms instead of HLS's 2-4 s.
+
+Plus: tier routing (/api/play/route), ROM proxy for EmulatorJS-in-browser,
+and save-state persistence shared across tiers.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import urllib.parse
+import uuid
 from pathlib import Path
+
 from aiohttp import web
-import websocket
+
+import runner_retroarch
+import saves
+import tiers
+from sessions import Allocator
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger('romm-stream')
 
 HLS_DIR = '/opt/romm-stream/hls'
 ROM_BASE = '/mnt/usb1/roms'
+PUBLIC_BASE = os.environ.get('ROMM_STREAM_PUBLIC', 'http://192.168.0.94:8091')
+
 STREAMS = {}
+ALLOC = Allocator()
 
 PLAYER_HTML = '''<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>__NAME__</title>
@@ -26,80 +52,81 @@ window.EJS_defaultOptions = {fullscreen: false};
 <script src="/emu/data/loader.js"></script>
 </body></html>'''
 
-CORE_MAP = {
-    'n64': 'n64', 'nes': 'nes', 'snes': 'snes',
-    'genesis-slash-megadrive': 'segaMD', 'gba': 'gba', 'gb': 'gb', 'gbc': 'gbc',
-    'nds': 'nds', 'psx': 'psx', 'psp': 'psp', 'arcade': 'arcade',
-    'atari2600': 'atari2600', 'sega32': 'sega32x', 'segacd': 'segaCD',
-    'saturn': 'saturn', '3do': '3do', 'jaguar': 'jaguar', 'lynx': 'lynx',
-    'ngc': 'gamecube', 'wii': 'wii', 'dreamcast': 'dc'
-}
-
+# CDP key map for the legacy Chromium/EmulatorJS sessions.
 KEY_MAP = {
     'up': 'ArrowUp', 'down': 'ArrowDown', 'left': 'ArrowLeft', 'right': 'ArrowRight',
     'a': 'KeyX', 'b': 'KeyZ', 'x': 'KeyS', 'y': 'KeyA',
     'l1': 'KeyQ', 'r1': 'KeyW', 'start': 'Enter', 'select': 'ShiftRight',
 }
 
-async def handle_start(req):
+
+def resolve_rom(platform: str, rom_name: str) -> Path | None:
+    """Path of a ROM under ROM_BASE; None if missing or traversal attempt."""
+    if not platform or not rom_name:
+        return None
+    base = Path(ROM_BASE).resolve()
     try:
-        data = await req.json()
-    except Exception:
-        data = {}
-    rom_path = data.get('rom_path', '')
-    platform = data.get('platform', 'n64')
-    rom_name = data.get('name', 'game')
+        p = (base / platform / rom_name).resolve()
+    except (OSError, ValueError):
+        return None
+    if not str(p).startswith(str(base)) or not p.is_file():
+        return None
+    return p
 
-    sid = uuid.uuid4().hex[:8]
-    stream_dir = Path(HLS_DIR) / sid
-    stream_dir.mkdir(exist_ok=True)
 
-    core = CORE_MAP.get(platform, platform)
-    rom_url = ''
-    rom_name_key = data.get('rom_name', '')
-    if rom_name_key and platform:
-        rom_path = ROM_BASE + '/' + platform + '/' + rom_name_key
-        if os.path.exists(rom_path):
-            rom_url = 'http://192.168.0.94:8091/roms/' + urllib.parse.quote(platform + '/' + rom_name_key)
+# ---------------------------------------------------------------- tier route
 
-    html = PLAYER_HTML.replace('__NAME__', rom_name).replace('__CORE__', core).replace('__ROM_URL__', rom_url)
-    (stream_dir / 'player.html').write_text(html)
+async def handle_route(req):
+    tier = tiers.route(req.query.get('platform', ''))
+    if tier is None:
+        return web.json_response({'error': 'unplayable'}, status=404)
+    return web.json_response({'tier': tier})
 
-    display_num = 90 + len(STREAMS)
-    display = ':' + str(display_num)
-    xvfb = await asyncio.create_subprocess_exec(
-        'Xvfb', display, '-screen', '0', '1280x720x24', '-ac',
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-    await asyncio.sleep(1)
 
-    debug_port = 9222 + len(STREAMS)
-    env = dict(os.environ)
-    env['DISPLAY'] = display
-    chrome = await asyncio.create_subprocess_exec(
-        'chromium', '--display=' + display,
-        '--no-sandbox', '--disable-gpu-sandbox',
-        '--use-gl=angle', '--use-angle=swiftshader',
-        '--enable-webgl', '--ignore-gpu-blocklist',
-        '--window-size=1280,720', '--start-fullscreen',
-        '--remote-debugging-port=' + str(debug_port),
-        'http://192.168.0.94:8091/player/' + sid + '/player.html',
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, env=env)
-    await asyncio.sleep(4)
+# ---------------------------------------------------------------- ROM proxy
 
-    # Discover CDP page websocket URL
-    cdp_ws = ''
+async def handle_romfile(req):
+    p = resolve_rom(req.match_info['platform'],
+                    urllib.parse.unquote(req.match_info['name']))
+    if p is None:
+        return web.json_response({'error': 'not found'}, status=404)
+    return web.FileResponse(p, headers={
+        'Access-Control-Allow-Origin': '*'})
+
+
+# ---------------------------------------------------------------- saves
+
+async def handle_save_put(req):
     try:
-        from urllib.request import urlopen
-        cdp_resp = urlopen('http://localhost:' + str(debug_port) + '/json', timeout=5)
-        pages = json.loads(cdp_resp.read())
-        if pages:
-            cdp_ws = pages[0].get('webSocketDebuggerUrl', '')
-    except Exception:
-        pass
+        p = saves.save_path(req.match_info['platform'],
+                            urllib.parse.unquote(req.match_info['name']))
+    except ValueError:
+        return web.json_response({'error': 'bad path'}, status=400)
+    body = await req.read()
+    if len(body) > saves.MAX_SAVE_BYTES:
+        return web.json_response({'error': 'too large'}, status=413)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(body)
+    return web.json_response({'ok': True, 'bytes': len(body)})
 
+
+async def handle_save_get(req):
+    try:
+        p = saves.save_path(req.match_info['platform'],
+                            urllib.parse.unquote(req.match_info['name']))
+    except ValueError:
+        return web.json_response({'error': 'bad path'}, status=400)
+    if not p.is_file():
+        return web.json_response({'error': 'no save'}, status=404)
+    return web.FileResponse(p, headers={'Access-Control-Allow-Origin': '*'})
+
+
+# ------------------------------------------------- legacy HLS (Roku) session
+
+async def start_ffmpeg_hls(display: str, stream_dir: Path):
     hls_path = str(stream_dir / 'stream.m3u8')
-    seg_pattern = str(stream_dir / 'seg_%03d.ts')
-    ffmpeg = await asyncio.create_subprocess_exec(
+    seg = str(stream_dir / 'seg_%03d.ts')
+    return await asyncio.create_subprocess_exec(
         'ffmpeg', '-f', 'x11grab', '-video_size', '1280x720',
         '-framerate', '30', '-i', display + '.0+0,0',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
@@ -107,30 +134,94 @@ async def handle_start(req):
         '-g', '15', '-keyint_min', '15',
         '-hls_time', '1', '-hls_list_size', '5',
         '-hls_flags', 'delete_segments+program_date_time',
-        '-hls_segment_filename', seg_pattern,
-        '-f', 'hls', hls_path,
+        '-hls_segment_filename', seg, '-f', 'hls', hls_path,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+
+
+async def handle_start(req):
+    """Roku-compatible HLS session. Uses RetroArch when the platform has a
+    server core (better compat), else the legacy Chromium+EmulatorJS page."""
+    try:
+        data = await req.json()
+    except Exception:
+        data = {}
+    platform = data.get('platform', 'n64')
+    rom_name = data.get('rom_name', '')
+    display_name = data.get('name', rom_name or 'game')
+
+    rom = resolve_rom(platform, rom_name)
+    if rom is None:
+        return web.json_response({'error': 'rom not found'}, status=404)
+
+    try:
+        display_num, debug_port = ALLOC.acquire()
+    except RuntimeError:
+        return web.json_response({'error': 'server busy'}, status=503)
+
+    sid = uuid.uuid4().hex[:8]
+    stream_dir = Path(HLS_DIR) / sid
+    stream_dir.mkdir(parents=True, exist_ok=True)
+    display = f':{display_num}'
+
+    xvfb = await runner_retroarch.start_xvfb(display_num)
+    engine, chrome, ra, cdp_ws = 'retroarch', None, None, ''
+
+    if tiers.stream_core(platform):
+        try:
+            ra = await runner_retroarch.start_retroarch(
+                platform, str(rom), display_num, rom_name)
+        except FileNotFoundError:
+            ra = None
+    if ra is None:
+        engine = 'chromium'
+        core = tiers.EJS_CORES.get(platform, platform)
+        rom_url = f'{PUBLIC_BASE}/roms/' + urllib.parse.quote(
+            platform + '/' + rom_name)
+        html = (PLAYER_HTML.replace('__NAME__', display_name)
+                .replace('__CORE__', core).replace('__ROM_URL__', rom_url))
+        (stream_dir / 'player.html').write_text(html)
+        chrome = await asyncio.create_subprocess_exec(
+            'chromium', '--display=' + display, '--no-sandbox',
+            '--disable-gpu-sandbox', '--use-gl=angle',
+            '--use-angle=swiftshader', '--enable-webgl',
+            '--ignore-gpu-blocklist', '--window-size=1280,720',
+            '--start-fullscreen',
+            '--remote-debugging-port=' + str(debug_port),
+            f'{PUBLIC_BASE}/player/{sid}/player.html',
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=dict(os.environ, DISPLAY=display))
+        await asyncio.sleep(4)
+        try:
+            from urllib.request import urlopen
+            pages = json.loads(urlopen(
+                f'http://localhost:{debug_port}/json', timeout=5).read())
+            if pages:
+                cdp_ws = pages[0].get('webSocketDebuggerUrl', '')
+        except Exception:
+            pass
+
+    ffmpeg = await start_ffmpeg_hls(display, stream_dir)
     await asyncio.sleep(2)
 
-    STREAMS[sid] = {
-        'xvfb': xvfb, 'chrome': chrome, 'ffmpeg': ffmpeg,
-        'display': display, 'debug_port': debug_port, 'rom_name': rom_name,
-        'cdp_ws': cdp_ws
-    }
-    hls_url = 'http://192.168.0.94:8091/hls/' + sid + '/stream.m3u8'
-    return web.json_response({'stream_id': sid, 'hls_url': hls_url, 'debug_port': debug_port})
+    STREAMS[sid] = {'xvfb': xvfb, 'chrome': chrome, 'retroarch': ra,
+                    'ffmpeg': ffmpeg, 'display_num': display_num,
+                    'engine': engine, 'rom_name': display_name,
+                    'cdp_ws': cdp_ws}
+    return web.json_response({
+        'stream_id': sid, 'engine': engine,
+        'hls_url': f'{PUBLIC_BASE}/hls/{sid}/stream.m3u8',
+        'debug_port': debug_port})
+
 
 async def handle_stop(req):
-    sid = req.match_info['sid']
-    s = STREAMS.pop(sid, None)
+    s = STREAMS.pop(req.match_info['sid'], None)
     if s:
-        for p in [s['ffmpeg'], s['chrome'], s['xvfb']]:
-            try:
-                p.terminate()
-                await asyncio.wait_for(p.wait(), timeout=3)
-            except Exception:
-                p.kill()
+        await runner_retroarch.terminate(
+            s.get('ffmpeg'), s.get('chrome'), s.get('retroarch'), s.get('xvfb'))
+        ALLOC.release(s['display_num'])
     return web.json_response({'ok': True})
+
 
 async def handle_input(req):
     sid = req.match_info['sid']
@@ -138,45 +229,115 @@ async def handle_input(req):
         data = await req.json()
     except Exception:
         data = {}
-    key = data.get('key', '')
-    pressed = data.get('pressed', True)
+    key, pressed = data.get('key', ''), data.get('pressed', True)
     s = STREAMS.get(sid)
     if not s:
         return web.json_response({'error': 'stream not found'}, status=404)
 
+    if s['engine'] == 'retroarch':
+        ok = await runner_retroarch.send_key(s['display_num'], key, pressed)
+        return web.json_response({'ok': ok, 'key': key})
+
     mapped = KEY_MAP.get(key, key)
     try:
-        ws_url = s.get('cdp_ws', '')
+        import websocket
+        ws_url = s.get('cdp_ws', '').replace('localhost', '127.0.0.1')
         if ws_url:
-            ws_url = ws_url.replace('localhost', '127.0.0.1')
             page_ws = websocket.create_connection(ws_url, timeout=2)
-            method = 'Input.dispatchKeyEvent'
-            params = {
-                'type': 'keyDown' if pressed else 'keyUp',
-                'key': mapped, 'code': mapped, 'windowsVirtualKeyCode': 0
-            }
-            page_ws.send(json.dumps({'id': 1, 'method': method, 'params': params}))
+            page_ws.send(json.dumps({'id': 1, 'method': 'Input.dispatchKeyEvent',
+                                     'params': {'type': 'keyDown' if pressed else 'keyUp',
+                                                'key': mapped, 'code': mapped,
+                                                'windowsVirtualKeyCode': 0}}))
             page_ws.close()
     except Exception:
         pass
     return web.json_response({'ok': True, 'key': key, 'mapped': mapped})
 
+
 async def handle_status(req):
     return web.json_response({'streams': [
-        {'id': k, 'name': v['rom_name']} for k, v in STREAMS.items()
-    ]})
+        {'id': k, 'name': v['rom_name'], 'engine': v['engine']}
+        for k, v in STREAMS.items()]})
+
+
+# ------------------------------------------------------ WebRTC (Xbox) session
+
+async def handle_rtc_signal(req):
+    """WS signaling + full session lifecycle for one WebRTC play session."""
+    platform = req.query.get('platform', '')
+    rom_name = urllib.parse.unquote(req.query.get('rom_name', ''))
+    rom = resolve_rom(platform, rom_name)
+    if rom is None or not tiers.stream_core(platform):
+        return web.json_response({'error': 'not streamable'}, status=404)
+
+    ws = web.WebSocketResponse(heartbeat=20)
+    await ws.prepare(req)
+
+    try:
+        display_num, _ = ALLOC.acquire()
+    except RuntimeError:
+        await ws.send_json({'type': 'error', 'error': 'server busy'})
+        await ws.close()
+        return ws
+
+    xvfb = ra = None
+    try:
+        xvfb = await runner_retroarch.start_xvfb(display_num)
+        # per-session pulse null sink for audio capture
+        await (await asyncio.create_subprocess_exec(
+            'pactl', 'load-module', 'module-null-sink',
+            f'sink_name=romm{display_num}',
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL)).wait()
+        ra = await runner_retroarch.start_retroarch(
+            platform, str(rom), display_num, rom_name)
+        await ws.send_json({'type': 'ready'})
+
+        import webrtc
+
+        async def cleanup():
+            await runner_retroarch.terminate(ra, xvfb)
+            ALLOC.release(display_num)
+
+        await webrtc.run_peer(ws, display_num, cleanup)
+    except Exception as e:
+        log.exception('rtc session failed')
+        try:
+            await ws.send_json({'type': 'error', 'error': str(e)})
+        except Exception:
+            pass
+        await runner_retroarch.terminate(ra, xvfb)
+        ALLOC.release(display_num)
+    finally:
+        if not ws.closed:
+            await ws.close()
+    return ws
+
+
+# --------------------------------------------------------------------- app
+
+def build_app() -> web.Application:
+    app = web.Application(client_max_size=saves.MAX_SAVE_BYTES + 1024)
+    r = app.router
+    r.add_post('/api/stream/start', handle_start)
+    r.add_post('/api/stream/{sid}/stop', handle_stop)
+    r.add_post('/api/stream/{sid}/input', handle_input)
+    r.add_get('/api/stream/status', handle_status)
+    r.add_get('/api/play/route', handle_route)
+    r.add_get('/api/romfile/{platform}/{name}', handle_romfile)
+    r.add_put('/api/saves/{platform}/{name}', handle_save_put)
+    r.add_get('/api/saves/{platform}/{name}', handle_save_get)
+    r.add_get('/api/rtc/signal', handle_rtc_signal)
+    return app
+
 
 async def main():
-    app = web.Application()
-    app.router.add_post('/api/stream/start', handle_start)
-    app.router.add_post('/api/stream/{sid}/stop', handle_stop)
-    app.router.add_post('/api/stream/{sid}/input', handle_input)
-    app.router.add_get('/api/stream/status', handle_status)
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(build_app())
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8090)
-    await site.start()
-    print('Stream server on :8090')
+    await web.TCPSite(runner, '0.0.0.0', 8090).start()
+    log.info('RomM stream server on :8090')
     await asyncio.Future()
 
-asyncio.run(main())
+
+if __name__ == '__main__':
+    asyncio.run(main())

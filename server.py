@@ -33,6 +33,14 @@ HLS_DIR = '/opt/romm-stream/hls'
 ROM_BASE = '/mnt/usb1/roms'
 PUBLIC_BASE = os.environ.get('ROMM_STREAM_PUBLIC', 'http://192.168.0.94:8091')
 
+# Origins a web session (POST /api/stream/start {"url": ...}) may open.
+WEB_SESSION_PREFIXES = (
+    'https://crypticrealm.com',
+    'https://www.crypticrealm.com',
+    'https://worldofclaudecraft.com',
+    'https://xbox.moveweight.com',
+)
+
 STREAMS = {}
 ALLOC = Allocator()
 
@@ -51,6 +59,17 @@ window.EJS_defaultOptions = {fullscreen: false};
 </script>
 <script src="/emu/data/loader.js"></script>
 </body></html>'''
+
+# CDP key map for web (Cryptic Realm) sessions: WASD movement + the game's
+# default binds (E interact, Space jump, digits = ability slots, Tab target).
+WEB_KEY_MAP = {
+    'up': ('KeyW', 'w'), 'down': ('KeyS', 's'),
+    'left': ('KeyA', 'a'), 'right': ('KeyD', 'd'),
+    'a': ('KeyE', 'e'), 'b': ('Escape', 'Escape'),
+    'x': ('Digit1', '1'), 'y': ('Digit2', '2'),
+    'l1': ('Tab', 'Tab'), 'r1': ('Space', ' '),
+    'start': ('KeyB', 'b'), 'select': ('Digit3', '3'),
+}
 
 # CDP key map for the legacy Chromium/EmulatorJS sessions.
 KEY_MAP = {
@@ -147,11 +166,19 @@ async def handle_start(req):
         data = {}
     platform = data.get('platform', 'n64')
     rom_name = data.get('rom_name', '')
+    web_url = data.get('url', '')
     display_name = data.get('name', rom_name or 'game')
 
-    rom = resolve_rom(platform, rom_name)
-    if rom is None:
-        return web.json_response({'error': 'rom not found'}, status=404)
+    rom = None
+    if web_url:
+        # Web session (e.g. Cryptic Realm on Roku): headless Chromium runs the
+        # page itself. Allowlisted origins only — this must not be an open proxy.
+        if not any(web_url.startswith(p) for p in WEB_SESSION_PREFIXES):
+            return web.json_response({'error': 'url not allowed'}, status=403)
+    else:
+        rom = resolve_rom(platform, rom_name)
+        if rom is None:
+            return web.json_response({'error': 'rom not found'}, status=404)
 
     try:
         display_num, debug_port = ALLOC.acquire()
@@ -166,7 +193,7 @@ async def handle_start(req):
     xvfb = await runner_retroarch.start_xvfb(display_num)
     engine, chrome, ra, cdp_ws = 'retroarch', None, None, ''
 
-    if tiers.stream_core(platform):
+    if rom is not None and tiers.stream_core(platform):
         try:
             ra = await runner_retroarch.start_retroarch(
                 platform, str(rom), display_num, rom_name)
@@ -174,12 +201,16 @@ async def handle_start(req):
             ra = None
     if ra is None:
         engine = 'chromium'
-        core = tiers.EJS_CORES.get(platform, platform)
-        rom_url = f'{PUBLIC_BASE}/roms/' + urllib.parse.quote(
-            platform + '/' + rom_name)
-        html = (PLAYER_HTML.replace('__NAME__', display_name)
-                .replace('__CORE__', core).replace('__ROM_URL__', rom_url))
-        (stream_dir / 'player.html').write_text(html)
+        if web_url:
+            page_url = web_url
+        else:
+            core = tiers.EJS_CORES.get(platform, platform)
+            rom_url = f'{PUBLIC_BASE}/roms/' + urllib.parse.quote(
+                platform + '/' + rom_name)
+            html = (PLAYER_HTML.replace('__NAME__', display_name)
+                    .replace('__CORE__', core).replace('__ROM_URL__', rom_url))
+            (stream_dir / 'player.html').write_text(html)
+            page_url = f'{PUBLIC_BASE}/player/{sid}/player.html'
         chrome = await asyncio.create_subprocess_exec(
             'chromium', '--display=' + display, '--no-sandbox',
             '--disable-gpu-sandbox', '--use-gl=angle',
@@ -187,7 +218,7 @@ async def handle_start(req):
             '--ignore-gpu-blocklist', '--window-size=1280,720',
             '--start-fullscreen',
             '--remote-debugging-port=' + str(debug_port),
-            f'{PUBLIC_BASE}/player/{sid}/player.html',
+            page_url,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             env=dict(os.environ, DISPLAY=display))
@@ -207,7 +238,7 @@ async def handle_start(req):
     STREAMS[sid] = {'xvfb': xvfb, 'chrome': chrome, 'retroarch': ra,
                     'ffmpeg': ffmpeg, 'display_num': display_num,
                     'engine': engine, 'rom_name': display_name,
-                    'cdp_ws': cdp_ws}
+                    'cdp_ws': cdp_ws, 'web': bool(web_url)}
     return web.json_response({
         'stream_id': sid, 'engine': engine,
         'hls_url': f'{PUBLIC_BASE}/hls/{sid}/stream.m3u8',
@@ -238,7 +269,10 @@ async def handle_input(req):
         ok = await runner_retroarch.send_key(s['display_num'], key, pressed)
         return web.json_response({'ok': ok, 'key': key})
 
-    mapped = KEY_MAP.get(key, key)
+    if s.get('web'):
+        code, char = WEB_KEY_MAP.get(key, (key, key))
+    else:
+        code = char = KEY_MAP.get(key, key)
     try:
         import websocket
         ws_url = s.get('cdp_ws', '').replace('localhost', '127.0.0.1')
@@ -246,12 +280,12 @@ async def handle_input(req):
             page_ws = websocket.create_connection(ws_url, timeout=2)
             page_ws.send(json.dumps({'id': 1, 'method': 'Input.dispatchKeyEvent',
                                      'params': {'type': 'keyDown' if pressed else 'keyUp',
-                                                'key': mapped, 'code': mapped,
+                                                'key': char, 'code': code,
                                                 'windowsVirtualKeyCode': 0}}))
             page_ws.close()
     except Exception:
         pass
-    return web.json_response({'ok': True, 'key': key, 'mapped': mapped})
+    return web.json_response({'ok': True, 'key': key, 'mapped': code})
 
 
 async def handle_status(req):

@@ -145,14 +145,27 @@ async def handle_save_get(req):
 async def start_ffmpeg_hls(display: str, stream_dir: Path):
     hls_path = str(stream_dir / 'stream.m3u8')
     seg = str(stream_dir / 'seg_%03d.ts')
+    # Roku's H.264 decoder only handles up to High profile @ 4:2:0 (yuv420p).
+    # x11grab captures RGB and libx264 would otherwise emit High 4:4:4 (yuv444p),
+    # which Roku cannot decode -> the Video node buffers forever. Force yuv420p +
+    # baseline-friendly profile/level, and add a silent AAC track (Roku HLS
+    # dislikes video-only streams). 2s GOP with segment-aligned keyframes.
     return await asyncio.create_subprocess_exec(
-        'ffmpeg', '-f', 'x11grab', '-video_size', '1280x720',
+        'ffmpeg',
+        '-f', 'x11grab', '-video_size', '1280x720',
         '-framerate', '30', '-i', display + '.0+0,0',
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-        '-b:v', '3M', '-maxrate', '3M', '-bufsize', '1.5M',
-        '-g', '15', '-keyint_min', '15',
-        '-hls_time', '1', '-hls_list_size', '5',
-        '-hls_flags', 'delete_segments+program_date_time',
+        '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+        '-profile:v', 'high', '-level', '4.0', '-pix_fmt', 'yuv420p',
+        '-b:v', '3M', '-maxrate', '3M', '-bufsize', '6M',
+        '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
+        '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+        '-hls_time', '2', '-hls_list_size', '6',
+        '-hls_flags', 'delete_segments+independent_segments',
+        # Roku's HLS player expects a MASTER playlist with #EXT-X-STREAM-INF,
+        # not a bare media playlist; without it playback fails with a vague
+        # "error in the HTTP response". Emit master.m3u8 alongside the media list.
+        '-master_pl_name', 'master.m3u8',
         '-hls_segment_filename', seg, '-f', 'hls', hls_path,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
 
@@ -233,15 +246,25 @@ async def handle_start(req):
             pass
 
     ffmpeg = await start_ffmpeg_hls(display, stream_dir)
-    await asyncio.sleep(2)
+    # Wait until the master playlist AND at least one segment exist before
+    # returning, otherwise the client (Roku) requests master.m3u8 during the
+    # FFmpeg startup window, gets 404, and aborts playback. Up to ~12s.
+    master_pl = stream_dir / 'master.m3u8'
+    for _ in range(60):
+        segs = list(stream_dir.glob('seg_*.ts'))
+        if master_pl.exists() and len(segs) >= 2:
+            break
+        await asyncio.sleep(0.2)
 
     STREAMS[sid] = {'xvfb': xvfb, 'chrome': chrome, 'retroarch': ra,
                     'ffmpeg': ffmpeg, 'display_num': display_num,
                     'engine': engine, 'rom_name': display_name,
                     'cdp_ws': cdp_ws, 'web': bool(web_url)}
+    # Point clients at the master playlist (Roku requires #EXT-X-STREAM-INF).
+    # RetroArch/HLS-only sessions without a master fall back to the media list.
     return web.json_response({
         'stream_id': sid, 'engine': engine,
-        'hls_url': f'{PUBLIC_BASE}/hls/{sid}/stream.m3u8',
+        'hls_url': f'{PUBLIC_BASE}/hls/{sid}/master.m3u8',
         'debug_port': debug_port})
 
 

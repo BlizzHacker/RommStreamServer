@@ -1,0 +1,14 @@
+[Unit]
+Description=RomM streaming server (HLS + WebRTC)
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/romm-stream
+ExecStartPre=/bin/sh -c 'pkill -f "Xvfb :9[0-3]" || true'
+ExecStart=/opt/romm-stream/venv/bin/python /opt/romm-stream/server.py
+Restart=always
+RestartSec=3
+Environment=ROMM_STREAM_PUBLIC=http://192.168.0.94:8091
+
+[Install]
+WantedBy=multi-user.target

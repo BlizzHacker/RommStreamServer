@@ -231,6 +231,10 @@ async def handle_start(req):
             '--ignore-gpu-blocklist', '--window-size=1280,720',
             '--start-fullscreen',
             '--remote-debugging-port=' + str(debug_port),
+            # Chromium >=111 rejects CDP WebSocket connections (403) unless the
+            # origin is allowlisted; without this every controller keypress
+            # fails silently at handle_input's websocket.create_connection.
+            '--remote-allow-origins=*',
             page_url,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,

@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>__TITLE__ Remote</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-user-select:none;user-select:none;touch-action:none;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+html,body{height:100%;background:#0B1020;color:#F8FAFC;overflow:hidden}
+#app{display:flex;flex-direction:column;height:100%}
+header{padding:10px 14px;display:flex;align-items:center;gap:10px;background:#121B33;border-bottom:1px solid #334B7A}
+header h1{font-size:16px;color:#7DD3FC;flex:1}
+#status{font-size:12px;color:#9FB3D9}
+.dot{width:9px;height:9px;border-radius:50%;background:#EF4444;display:inline-block;margin-right:5px}
+.dot.on{background:#4ADE80}
+.pad{width:9px;height:9px;border-radius:50%;background:#334B7A;display:inline-block;margin-left:6px}
+.pad.on{background:#7DD3FC;box-shadow:0 0 6px #7DD3FC}
+main{flex:1;position:relative;display:flex;align-items:center;justify-content:space-between;padding:16px;gap:12px}
+/* D-pad */
+#dpad{display:grid;grid-template-columns:64px 64px 64px;grid-template-rows:64px 64px 64px;gap:4px}
+.dbtn{background:#1E2D50;border:2px solid #334B7A;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:26px;color:#F8FAFC}
+.dbtn:active,.dbtn.hit{background:#7DD3FC;color:#0B1020}
+#d-up{grid-column:2;grid-row:1}#d-left{grid-column:1;grid-row:2}#d-right{grid-column:3;grid-row:2}#d-down{grid-column:2;grid-row:3}
+#d-mid{grid-column:2;grid-row:2;background:transparent;border:none}
+/* face buttons */
+#face{display:grid;grid-template-columns:70px 70px;grid-template-rows:70px 70px;gap:8px}
+.fbtn{width:70px;height:70px;border-radius:50%;border:3px solid;background:#1E2D50;font-size:24px;font-weight:bold;display:flex;align-items:center;justify-content:center}
+.fbtn:active,.fbtn.hit{filter:brightness(1.8)}
+#b-y{grid-column:1;grid-row:1;border-color:#FDE68A;color:#FDE68A}
+#b-x{grid-column:1;grid-row:2;border-color:#3B82F6;color:#3B82F6}
+#b-b{grid-column:2;grid-row:1;border-color:#EF4444;color:#EF4444}
+#b-a{grid-column:2;grid-row:2;border-color:#4ADE80;color:#4ADE80}
+/* center + shoulders */
+#center{position:absolute;left:50%;top:14px;transform:translateX(-50%);display:flex;gap:10px}
+.cbtn{padding:8px 14px;background:#1E2D50;border:2px solid #334B7A;border-radius:16px;font-size:12px;color:#F8FAFC}
+.cbtn:active,.cbtn.hit{background:#7DD3FC;color:#0B1020}
+#shoulders{position:absolute;left:0;right:0;top:70px;display:flex;justify-content:space-between;padding:0 16px}
+.sbtn{padding:10px 22px;background:#1E2D50;border:2px solid #334B7A;border-radius:8px;font-size:13px}
+.sbtn:active,.sbtn.hit{background:#7DD3FC;color:#0B1020}
+/* bottom toolbar */
+#tools{display:flex;gap:8px;padding:10px 14px;background:#121B33;border-top:1px solid #334B7A}
+#tools button{flex:1;padding:12px;background:#1E2D50;border:2px solid #334B7A;border-radius:8px;color:#F8FAFC;font-size:13px}
+#tools button:active{background:#334B7A}
+#tools button.accent{background:#4ADE80;color:#0B1020;border-color:#4ADE80}
+/* keyboard overlay */
+#kb{position:absolute;inset:0;background:rgba(11,16,32,.97);display:none;flex-direction:column;padding:16px;z-index:20}
+#kb.show{display:flex}
+#kb input{padding:14px;font-size:18px;border-radius:8px;border:2px solid #334B7A;background:#121B33;color:#fff;margin-bottom:12px}
+#kb .row{display:flex;gap:8px}
+#kb .row button{flex:1;padding:14px;border-radius:8px;border:none;font-size:15px}
+#send-kb{background:#4ADE80;color:#0B1020}#close-kb{background:#334B7A;color:#fff}
+/* mouse pad */
+#mouse{position:absolute;inset:0;background:rgba(11,16,32,.97);display:none;flex-direction:column;z-index:20}
+#mouse.show{display:flex}
+#trackpad{flex:1;margin:14px;border:2px dashed #334B7A;border-radius:12px;display:flex;align-items:center;justify-content:center;color:#9FB3D9;font-size:14px;position:relative}
+#mouse .mrow{display:flex;gap:8px;padding:0 14px 14px}
+#mouse .mrow button{flex:1;padding:16px;border-radius:8px;border:2px solid #334B7A;background:#1E2D50;color:#fff;font-size:14px}
+#mouse .mrow button:active{background:#7DD3FC;color:#0B1020}
+#mouse .close{background:#334B7A}
+.hint{position:absolute;bottom:8px;left:0;right:0;text-align:center;font-size:11px;color:#9FB3D9}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1 id="title">__TITLE__</h1>
+    <span id="status"><span class="dot" id="conn"></span>searching<span class="pad" id="gp"></span></span>
+  </header>
+  <main>
+    <div id="dpad">
+      <button class="dbtn" id="d-up" data-k="up">▲</button>
+      <button class="dbtn" id="d-left" data-k="left">◀</button>
+      <div id="d-mid"></div>
+      <button class="dbtn" id="d-right" data-k="right">▶</button>
+      <button class="dbtn" id="d-down" data-k="down">▼</button>
+    </div>
+    <div id="center">
+      <button class="cbtn" data-k="select">SELECT</button>
+      <button class="cbtn" data-k="start">START</button>
+    </div>
+    <div id="shoulders">
+      <button class="sbtn" data-k="l1">LB</button>
+      <button class="sbtn" data-k="r1">RB</button>
+    </div>
+    <div id="face">
+      <button class="fbtn" id="b-y" data-k="y">Y</button>
+      <button class="fbtn" id="b-x" data-k="x">X</button>
+      <button class="fbtn" id="b-b" data-k="b">B</button>
+      <button class="fbtn" id="b-a" data-k="a">A</button>
+    </div>
+  </main>
+  <div id="tools">
+    <button id="open-mouse">🖱 Mouse</button>
+    <button id="open-kb">⌨ Keyboard</button>
+    <button id="btn-pair" class="accent">Reconnect</button>
+  </div>
+</div>
+
+<div id="kb">
+  <input id="kb-input" type="text" placeholder="Type here (login, search, etc.)" autocomplete="off" autocapitalize="off">
+  <div class="row">
+    <button id="send-kb">Send text</button>
+    <button id="send-enter">Enter ⏎</button>
+    <button id="close-kb">Close</button>
+  </div>
+</div>
+
+<div id="mouse">
+  <div id="trackpad">Drag to move cursor
+    <div class="hint">Tap = left click · two-finger tap = right click</div>
+  </div>
+  <div class="mrow">
+    <button data-m="left">Left click</button>
+    <button data-m="right">Right click</button>
+    <button class="close" id="close-mouse">Close</button>
+  </div>
+</div>
+
+<script>
+const CFG = { client: "__CLIENT__", base: "" };
+let sid = "", connected = false;
+
+function setStatus(txt, on){ document.getElementById('status').firstChild.nextSibling.textContent = txt;
+  document.getElementById('conn').classList.toggle('on', !!on); }
+setStatus = (txt,on)=>{ const s=document.getElementById('status');
+  s.innerHTML = '<span class="dot'+(on?' on':'')+'" id="conn"></span>'+txt+'<span class="pad'+(gpOn?' on':'')+'" id="gp"></span>'; };
+
+/* ---- find the active session for this client ---- */
+async function poll(){
+  try{
+    const r = await fetch('/api/stream/status'); const j = await r.json();
+    // prefer a stream whose client matches; else the newest
+    let s = (j.streams||[]).find(x=>x.client===CFG.client) || (j.streams||[])[0];
+    if(s){ if(sid!==s.id){ sid=s.id; connected=true; setStatus('connected: '+(s.name||s.id),true);} }
+    else { connected=false; sid=""; setStatus('waiting for a game…',false); }
+  }catch(e){ connected=false; setStatus('server offline',false); }
+}
+setInterval(poll, 2000); poll();
+
+/* ---- send a game input ---- */
+function send(key, pressed){
+  if(!sid) return;
+  fetch('/api/stream/'+sid+'/input',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key,pressed})}).catch(()=>{});
+}
+
+/* ---- touch buttons (press + release) ---- */
+document.querySelectorAll('[data-k]').forEach(btn=>{
+  const k = btn.dataset.k;
+  const down = e=>{ e.preventDefault(); btn.classList.add('hit'); send(k,true); };
+  const up   = e=>{ e.preventDefault(); btn.classList.remove('hit'); send(k,false); };
+  btn.addEventListener('pointerdown',down); btn.addEventListener('pointerup',up);
+  btn.addEventListener('pointerleave',up); btn.addEventListener('pointercancel',up);
+});
+
+/* ---- keyboard: send typed text char-by-char + Enter ---- */
+document.getElementById('open-kb').onclick=()=>{document.getElementById('kb').classList.add('show');document.getElementById('kb-input').focus();};
+document.getElementById('close-kb').onclick=()=>document.getElementById('kb').classList.remove('show');
+document.getElementById('send-kb').onclick=async()=>{
+  const v=document.getElementById('kb-input').value;
+  if(sid&&v){ await fetch('/api/stream/'+sid+'/text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:v})}); }
+  document.getElementById('kb-input').value='';
+};
+document.getElementById('send-enter').onclick=()=>{ send('enter',true); setTimeout(()=>send('enter',false),60); };
+
+/* ---- mouse / trackpad ---- */
+document.getElementById('open-mouse').onclick=()=>document.getElementById('mouse').classList.add('show');
+document.getElementById('close-mouse').onclick=()=>document.getElementById('mouse').classList.remove('show');
+const tp=document.getElementById('trackpad'); let lastX=null,lastY=null,moved=false,touchStart=0,ptrs=0;
+tp.addEventListener('pointerdown',e=>{lastX=e.clientX;lastY=e.clientY;moved=false;touchStart=Date.now();ptrs++;});
+tp.addEventListener('pointermove',e=>{ if(lastX===null)return; const dx=e.clientX-lastX,dy=e.clientY-lastY;
+  if(Math.abs(dx)+Math.abs(dy)>2){moved=true; mouse('move',dx,dy); lastX=e.clientX;lastY=e.clientY;} });
+tp.addEventListener('pointerup',e=>{ if(!moved && Date.now()-touchStart<250){ mouse(ptrs>=2?'right':'left'); } lastX=null;ptrs=Math.max(0,ptrs-1); });
+document.querySelectorAll('#mouse .mrow [data-m]').forEach(b=>b.onclick=()=>mouse(b.dataset.m));
+function mouse(action,dx,dy){ if(!sid)return;
+  fetch('/api/stream/'+sid+'/mouse',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action,dx:dx||0,dy:dy||0})}).catch(()=>{}); }
+
+document.getElementById('btn-pair').onclick=poll;
+
+/* ---- Gamepad API: read connected Xbox controllers ---- */
+let gpOn=false;
+const GP_MAP = {0:'a',1:'b',2:'x',3:'y',4:'l1',5:'r1',8:'select',9:'start',12:'up',13:'down',14:'left',15:'right'};
+const gpPrev={};
+window.addEventListener('gamepadconnected',()=>{gpOn=true;});
+window.addEventListener('gamepaddisconnected',()=>{gpOn=[...navigator.getGamepads()].some(p=>p&&p.connected);});
+function gpLoop(){
+  const pads=navigator.getGamepads?navigator.getGamepads():[];
+  const p=[...pads].find(x=>x&&x.connected);
+  gpOn=!!p; document.getElementById('gp')&&document.getElementById('gp').classList.toggle('on',gpOn);
+  if(p&&sid){
+    for(const [i,k] of Object.entries(GP_MAP)){
+      const pressed=!!(p.buttons[i]&&p.buttons[i].pressed);
+      if(pressed!==!!gpPrev[k]){ gpPrev[k]=pressed; send(k,pressed); }
+    }
+    // left stick -> dpad
+    const ax=p.axes[0]||0, ay=p.axes[1]||0, DZ=0.5;
+    const dirs={left:ax<-DZ,right:ax>DZ,up:ay<-DZ,down:ay>DZ};
+    for(const [d,v] of Object.entries(dirs)){
+      if(v!==!!gpPrev['ax'+d]){ gpPrev['ax'+d]=v; send(d,v); }
+    }
+  }
+  requestAnimationFrame(gpLoop);
+}
+requestAnimationFrame(gpLoop);
+</script>
+</body>
+</html>

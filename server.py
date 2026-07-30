@@ -116,11 +116,34 @@ def resolve_rom(platform: str, rom_name: str) -> Path | None:
 
 # ---------------------------------------------------------------- tier route
 
+async def handle_streamable(req):
+    """What this server can actually stream, and why not for the rest.
+
+    The client mirrors this instead of hardcoding a core list, so a platform is
+    never offered on a server that has no core or no firmware for it.
+    """
+    slugs = tiers.streamable_slugs()
+    unavailable = {}
+    for slug in sorted(tiers.RETROARCH_CORES):
+        if slug not in slugs:
+            why = tiers.why_not(slug)
+            if why:
+                unavailable[slug] = why
+    return _cors(web.json_response({'streamable': slugs,
+                                    'unavailable': unavailable}))
+
+
 async def handle_route(req):
-    tier = tiers.route(req.query.get('platform', ''))
+    slug = req.query.get('platform', '')
+    tier = tiers.route(slug)
     if tier is None:
-        return web.json_response({'error': 'unplayable'}, status=404)
-    return web.json_response({'tier': tier})
+        # Say which of the several reasons it is: "no core exists" and "you need
+        # to supply firmware" are very different problems for the operator.
+        return _cors(web.json_response(
+            {'error': 'unplayable',
+             'why': tiers.why_not(slug) or 'no emulator exists for this platform'},
+            status=404))
+    return _cors(web.json_response({'tier': tier}))
 
 
 # ---------------------------------------------------------------- ROM proxy
@@ -574,6 +597,89 @@ async def handle_remote(req):
 
 # ------------------------------------------------------ WebRTC (Xbox) session
 
+# Sessions started over HTTP, keyed by session id. The WebSocket path keeps its
+# session on the connection; this one has to outlive a request.
+RTC_SESSIONS: dict = {}
+
+
+async def handle_rtc_offer(req):
+    """Start a session and answer an SDP offer in one request.
+
+    CORS is answered permissively because the caller is a packaged app on another
+    origin (app.local) and this server is LAN-only by design.
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        return _cors(web.json_response({'error': 'bad json'}, status=400))
+
+    platform = (body.get('platform') or '').strip()
+    rom_name = (body.get('rom_name') or '').strip()
+    sdp = body.get('sdp') or ''
+    if not sdp:
+        return _cors(web.json_response({'error': 'no sdp'}, status=400))
+
+    rom = resolve_rom(platform, rom_name)
+    if rom is None or not tiers.stream_core(platform):
+        return _cors(web.json_response(
+            {'error': 'not streamable'}, status=404))
+
+    try:
+        display_num, _ = ALLOC.acquire()
+    except RuntimeError:
+        return _cors(web.json_response({'error': 'server busy'}, status=503))
+
+    sid = uuid.uuid4().hex
+    xvfb = ra = None
+    try:
+        xvfb = await runner_retroarch.start_xvfb(display_num)
+        await (await asyncio.create_subprocess_exec(
+            'pactl', 'load-module', 'module-null-sink',
+            f'sink_name=romm{display_num}',
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL)).wait()
+        ra = await runner_retroarch.start_retroarch(
+            platform, str(rom), display_num, rom_name)
+
+        import webrtc
+
+        async def cleanup():
+            RTC_SESSIONS.pop(sid, None)
+            await runner_retroarch.terminate(ra, xvfb)
+            ALLOC.release(display_num)
+
+        pc, answer_sdp, close = await webrtc.answer_offer(
+            display_num, sdp, cleanup)
+        RTC_SESSIONS[sid] = {'pc': pc, 'close': close,
+                             'display': display_num}
+        return _cors(web.json_response({'session_id': sid,
+                                        'sdp': answer_sdp}))
+    except Exception as e:
+        log.exception('rtc offer failed')
+        await runner_retroarch.terminate(ra, xvfb)
+        ALLOC.release(display_num)
+        return _cors(web.json_response({'error': str(e)}, status=500))
+
+
+async def handle_rtc_stop(req):
+    s = RTC_SESSIONS.get(req.match_info.get('sid', ''))
+    if s is None:
+        return _cors(web.json_response({'ok': True, 'note': 'already gone'}))
+    await s['close']()
+    return _cors(web.json_response({'ok': True}))
+
+
+async def handle_rtc_options(req):
+    return _cors(web.Response(status=204))
+
+
+def _cors(resp):
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return resp
+
+
 async def handle_rtc_signal(req):
     """WS signaling + full session lifecycle for one WebRTC play session."""
     platform = req.query.get('platform', '')
@@ -639,10 +745,16 @@ def build_app() -> web.Application:
     r.add_get('/api/stream/status', handle_status)
     r.add_get('/remote', handle_remote)
     r.add_get('/api/play/route', handle_route)
+    r.add_get('/api/play/streamable', handle_streamable)
     r.add_get('/api/romfile/{platform}/{name}', handle_romfile)
     r.add_put('/api/saves/{platform}/{name}', handle_save_put)
     r.add_get('/api/saves/{platform}/{name}', handle_save_get)
     r.add_get('/api/rtc/signal', handle_rtc_signal)
+    # HTTP signaling, for clients that cannot use the WebSocket one — see
+    # webrtc.answer_offer for why the Xbox shell is one of them.
+    r.add_post('/api/rtc/offer', handle_rtc_offer)
+    r.add_options('/api/rtc/offer', handle_rtc_options)
+    r.add_post('/api/rtc/{sid}/stop', handle_rtc_stop)
     return app
 
 

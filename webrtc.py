@@ -29,6 +29,77 @@ def _media_players(display_num: int):
     return video, audio
 
 
+def _attach_input(pc, display_num: int):
+    """Wire the 'input' data channel to the session's virtual input."""
+    @pc.on('datachannel')
+    def on_datachannel(channel):
+        @channel.on('message')
+        def on_message(message):
+            try:
+                m = json.loads(message)
+            except Exception:
+                return
+            if 'axes' in m:
+                # Analog sticks need a uinput virtual pad; xdotool can only send
+                # key events. Accepted and dropped for now so the protocol does
+                # not have to change when that lands — the client also synthesises
+                # d-pad presses from the stick, so movement still works.
+                return
+            asyncio.ensure_future(runner_retroarch.send_key(
+                display_num, m.get('key', ''), bool(m.get('pressed'))))
+
+
+async def answer_offer(display_num: int, offer_sdp: str, on_close):
+    """Answer a complete SDP offer over HTTP and return (pc, answer_sdp).
+
+    The HTTP path exists because the Xbox shell cannot use the WebSocket one: the
+    packaged app is served from an https origin, so a ws:// URL to a LAN stream
+    server is blocked mixed content, and WebSockets cannot be routed through the
+    host's request interception the way HTTP can. Media is peer-to-peer UDP and
+    unaffected either way.
+    """
+    from aiortc import (RTCPeerConnection, RTCSessionDescription,
+                        RTCConfiguration, RTCIceServer)
+
+    pc = RTCPeerConnection(RTCConfiguration(
+        iceServers=[RTCIceServer(**s) for s in ICE_SERVERS]))
+    video, audio = _media_players(display_num)
+    pc.addTrack(video.video)
+    if audio and audio.audio:
+        pc.addTrack(audio.audio)
+
+    _attach_input(pc, display_num)
+    closed = asyncio.Event()
+
+    async def close():
+        if closed.is_set():
+            return
+        closed.set()
+        try:
+            await pc.close()
+        finally:
+            for mp in (video, audio):
+                if mp:
+                    try:
+                        mp._stop(mp.video or mp.audio)  # noqa: best-effort
+                    except Exception:
+                        pass
+            await on_close()
+
+    @pc.on('connectionstatechange')
+    async def on_state():
+        if pc.connectionState in ('failed', 'closed', 'disconnected'):
+            await close()
+
+    await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp,
+                                                        type='offer'))
+    answer = await pc.createAnswer()
+    # aiortc finishes ICE gathering before this resolves, so the SDP it produces
+    # is complete — which is what lets signaling be a single request/response.
+    await pc.setLocalDescription(answer)
+    return pc, pc.localDescription.sdp, close
+
+
 async def run_peer(ws, display_num: int, on_close):
     """Drive one WebRTC peer over an aiohttp WebSocketResponse used as the
     signaling channel. Messages: {type: offer|ice}, replies {type: answer|ice}.

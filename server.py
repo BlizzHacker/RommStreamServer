@@ -24,6 +24,7 @@ from aiohttp import web
 import runner_retroarch
 import saves
 import tiers
+import vpad
 from sessions import Allocator
 
 logging.basicConfig(level=logging.INFO)
@@ -631,7 +632,11 @@ async def handle_rtc_offer(req):
 
     sid = uuid.uuid4().hex
     xvfb = ra = None
+    pad = None
     try:
+        # Created before RetroArch starts so its input driver enumerates the pad
+        # at launch; a pad appearing later is not always picked up.
+        pad = vpad.create()
         xvfb = await runner_retroarch.start_xvfb(display_num)
         await (await asyncio.create_subprocess_exec(
             'pactl', 'load-module', 'module-null-sink',
@@ -646,10 +651,12 @@ async def handle_rtc_offer(req):
         async def cleanup():
             RTC_SESSIONS.pop(sid, None)
             await runner_retroarch.terminate(ra, xvfb)
+            if pad is not None:
+                pad.close()
             ALLOC.release(display_num)
 
         pc, answer_sdp, close = await webrtc.answer_offer(
-            display_num, sdp, cleanup)
+            display_num, sdp, cleanup, pad)
         RTC_SESSIONS[sid] = {'pc': pc, 'close': close,
                              'display': display_num}
         return _cors(web.json_response({'session_id': sid,
@@ -657,6 +664,8 @@ async def handle_rtc_offer(req):
     except Exception as e:
         log.exception('rtc offer failed')
         await runner_retroarch.terminate(ra, xvfb)
+        if pad is not None:
+            pad.close()
         ALLOC.release(display_num)
         return _cors(web.json_response({'error': str(e)}, status=500))
 

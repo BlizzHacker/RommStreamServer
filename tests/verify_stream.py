@@ -13,13 +13,43 @@ is exactly why the shell routes through its native host instead.
 
 Usage: python3 verify_stream.py <platform> <rom-name> [base-url]
 """
+import glob
 import json
+import os
 import subprocess
 import sys
 import time
 
 import requests
 import websocket
+
+
+def emulator_procs():
+    """(pid, cmdline) for every running RetroArch."""
+    out = []
+    for path in glob.glob('/proc/[0-9]*/cmdline'):
+        try:
+            with open(path, 'rb') as f:
+                argv = f.read().split(b'\0')
+        except OSError:
+            continue
+        if argv and argv[0].endswith(b'retroarch'):
+            out.append((path.split('/')[2],
+                        b' '.join(a for a in argv if a).decode('utf8', 'replace')))
+    return out
+
+
+def open_input_nodes(pid):
+    """Input device nodes this process has open."""
+    found = []
+    for fd in glob.glob(f'/proc/{pid}/fd/*'):
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if '/input/' in target:
+            found.append(target)
+    return found
 
 platform = sys.argv[1] if len(sys.argv) > 1 else 'vectrex'
 rom = sys.argv[2] if len(sys.argv) > 2 else None
@@ -146,6 +176,23 @@ try:
             time.sleep(2)
         check('video frames decode on the client', isinstance(w, int) and w > 0,
               f'{w}x{ev("__v && __v.videoHeight || 0")}')
+
+        # Frames arriving proves the capture chain, NOT that a game is running.
+        # x11grab streams an empty Xvfb display at a healthy 30 fps, so this suite
+        # once passed every check with no emulator process alive at all. Assert the
+        # emulator itself.
+        procs = emulator_procs()
+        check('the emulator is actually running', bool(procs),
+              procs[0][1][:90] if procs else 'no retroarch process exists')
+        if procs:
+            pid = procs[0][0]
+            nodes = open_input_nodes(pid)
+            # Not yet a failure: RetroArch here cannot load a config, so its
+            # joypad driver cannot be switched to one that sees a virtual pad.
+            # Buttons still work through key injection; analog does not.
+            print(f"{'PASS' if nodes else 'INFO'}  emulator holds an input device"
+                  f"  [{', '.join(nodes) if nodes else 'none — analog input unavailable'}]",
+                  flush=True)
         check('peer connection reached a live state',
               ev('__st.state') in ('connected', 'answered'), str(ev('__st.state')))
 

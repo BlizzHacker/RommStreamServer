@@ -29,8 +29,13 @@ def _media_players(display_num: int):
     return video, audio
 
 
-def _attach_input(pc, display_num: int):
-    """Wire the 'input' data channel to the session's virtual input."""
+def _attach_input(pc, display_num: int, pad=None):
+    """Wire the 'input' data channel to the session's input.
+
+    A virtual pad is used when one could be created, because analog sticks cannot
+    be expressed as key events and anything with a 3D camera needs them. Without
+    one, buttons still work via key injection.
+    """
     @pc.on('datachannel')
     def on_datachannel(channel):
         @channel.on('message')
@@ -40,16 +45,18 @@ def _attach_input(pc, display_num: int):
             except Exception:
                 return
             if 'axes' in m:
-                # Analog sticks need a uinput virtual pad; xdotool can only send
-                # key events. Accepted and dropped for now so the protocol does
-                # not have to change when that lands — the client also synthesises
-                # d-pad presses from the stick, so movement still works.
+                if pad is not None:
+                    pad.axes(m.get('axes') or [])
+                return
+            key = m.get('key', '')
+            pressed = bool(m.get('pressed'))
+            if pad is not None and pad.press(key, pressed):
                 return
             asyncio.ensure_future(runner_retroarch.send_key(
-                display_num, m.get('key', ''), bool(m.get('pressed'))))
+                display_num, key, pressed))
 
 
-async def answer_offer(display_num: int, offer_sdp: str, on_close):
+async def answer_offer(display_num: int, offer_sdp: str, on_close, pad=None):
     """Answer a complete SDP offer over HTTP and return (pc, answer_sdp).
 
     The HTTP path exists because the Xbox shell cannot use the WebSocket one: the
@@ -68,7 +75,7 @@ async def answer_offer(display_num: int, offer_sdp: str, on_close):
     if audio and audio.audio:
         pc.addTrack(audio.audio)
 
-    _attach_input(pc, display_num)
+    _attach_input(pc, display_num, pad)
     closed = asyncio.Event()
 
     async def close():

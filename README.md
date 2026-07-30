@@ -1,5 +1,8 @@
 # RomM Stream Server
 
+A project of the [Move Weight Foundation](https://foundation.moveweight.com), a
+501(c)(3).
+
 Shared game-play backend for a [RomM](https://github.com/rommapp/romm) library.
 One server, two delivery paths:
 

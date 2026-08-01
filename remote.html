@@ -159,19 +159,28 @@ const CFG = { client: "__CLIENT__" };
 let sid = "", connected = false, curName = "", curPlatform = "", curLayoutKey = "";
 const held = {};
 
+// Fire input with as little client-side latency as possible: keepalive lets the
+// browser reuse a warm connection and never cancels the request, and text/plain
+// avoids a CORS preflight. sendBeacon is used when available — it's the lowest-
+// overhead fire-and-forget the platform offers.
+function post(path, obj){
+  const body = JSON.stringify(obj);
+  if(navigator.sendBeacon){
+    try { navigator.sendBeacon(path, new Blob([body], {type:'text/plain'})); return; }
+    catch(e){ /* fall through to fetch */ }
+  }
+  fetch(path,{method:'POST',headers:{'Content-Type':'text/plain'},
+    body:body,keepalive:true}).catch(function(){});
+}
 function send(k, pressed){
   if(!sid) return;
   if(!!held[k] === !!pressed) return;
   held[k] = pressed;
-  fetch('/api/stream/'+sid+'/input',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({key:k,pressed:pressed})}).catch(function(){});
+  post('/api/stream/'+sid+'/input', {key:k,pressed:pressed});
 }
 function sendAxis(side, x, y){
   if(!sid) return;
-  fetch('/api/stream/'+sid+'/analog',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({stick:side,x:x,y:y})}).catch(function(){});
+  post('/api/stream/'+sid+'/analog', {stick:side,x:x,y:y});
 }
 function bindHold(el, k){
   el.setAttribute('data-k', k);   // lets a physical-pad press flash this button

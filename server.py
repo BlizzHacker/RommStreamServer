@@ -50,6 +50,14 @@ WEB_SESSION_PREFIXES = (
 # RomM base can be passed per-request as romm_base for "anyone's RomM server".
 ROMM_LOCAL_BASE = os.environ.get('ROMM_BASE', 'http://localhost:8080')
 
+# The GPU stream runner (mw-laptop VM 9000, RTX 3050) renders the heavy 3D
+# platforms this GPU-less host cannot. CT104 proxies those platforms there.
+GPU_HOST = os.environ.get('GPU_HOST', 'http://192.168.0.201:8090')
+GPU_PLATFORMS = {'n64', 'psx', 'ps', 'ps2', 'ngc', 'wii', 'dc', 'dreamcast',
+                 'naomi', 'atomiswave', 'saturn', 'psp'}
+# Sessions we handed to the GPU host, sid -> True, so input/stop proxy there too.
+GPU_STREAMS = {}
+
 STREAMS = {}
 ALLOC = Allocator()
 
@@ -149,9 +157,28 @@ async def handle_streamable(req):
     ejs_unavailable = sorted(
         slug for slug, system in tiers.EJS_CORES.items()
         if not tiers.ejs_core_installed(system))
-    return _cors(web.json_response({'streamable': slugs,
+    # Fold in the heavy 3D platforms the GPU host renders, so the client offers
+    # N64/PS1/PS2/GC/DC/Saturn/PSP too. Best-effort: if the GPU host is down we
+    # just omit them rather than fail the whole listing.
+    gpu_slugs = await _gpu_streamable()
+    merged = sorted(set(slugs) | set(gpu_slugs))
+    for g in gpu_slugs:
+        unavailable.pop(g, None)          # no longer "unavailable" — GPU has it
+    return _cors(web.json_response({'streamable': merged,
                                     'unavailable': unavailable,
                                     'ejs_unavailable': ejs_unavailable}))
+
+
+async def _gpu_streamable():
+    """Ask the GPU host what it can render; empty list if it's unreachable."""
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f'{GPU_HOST}/api/play/streamable',
+                             timeout=aiohttp.ClientTimeout(total=4)) as r:
+                return (await r.json()).get('streamable', [])
+    except Exception:
+        return []
 
 
 async def handle_route(req):
@@ -364,6 +391,39 @@ async def romm_autoplay(cdp_ws, base, rom_id, user, password):
             pass
 
 
+async def _proxy_to_gpu(data):
+    """Forward a start request to the GPU host and return its JSON response.
+
+    The GPU host serves HLS from its own address, so its hls_url already points
+    at the right place; we just remember the sid so input/stop go there too.
+    """
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f'{GPU_HOST}/api/stream/start', json=data,
+                              timeout=aiohttp.ClientTimeout(total=90)) as r:
+                body = await r.json()
+                if r.status == 200 and body.get('stream_id'):
+                    GPU_STREAMS[body['stream_id']] = True
+                return web.json_response(body, status=r.status)
+    except Exception as e:
+        return web.json_response(
+            {'error': f'gpu host unreachable: {e}'}, status=502)
+
+
+async def _proxy_to_gpu_path(sid, path, method='POST', data=None):
+    """Proxy an input/stop call for a GPU session to the GPU host."""
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as s:
+            m = s.post if method == 'POST' else s.get
+            async with m(f'{GPU_HOST}/api/stream/{sid}{path}', json=data,
+                         timeout=aiohttp.ClientTimeout(total=10)) as r:
+                return web.json_response(await r.json(), status=r.status)
+    except Exception:
+        return web.json_response({'ok': False}, status=502)
+
+
 async def handle_start(req):
     """Roku-compatible HLS session. Uses RetroArch when the platform has a
     server core (better compat), else the legacy Chromium+EmulatorJS page."""
@@ -376,6 +436,7 @@ async def handle_start(req):
     web_url = data.get('url', '')
     client = data.get('client', '')
     display_name = data.get('name', rom_name or 'game')
+
     # RomM autoplay: drive RomM's own web UI (login -> EJS launcher -> Play) in
     # Chromium, exactly like a real user, so RomM configures the emulator. Far
     # more reliable than launching a bare EJS core headless.
@@ -385,6 +446,14 @@ async def handle_start(req):
     romm_pass = data.get('romm_pass', '')
     if romm_rom_id:
         web_url = f'{romm_base}/rom/{romm_rom_id}/ejs'
+
+    # Heavy 3D platforms (N64/PS1/PS2/GC/Wii/DC/Saturn/PSP) can't render on this
+    # GPU-less host — they go to the GPU runner on the mw-laptop VM (RTX 3050,
+    # shared with ArcForge but not disrupting it). CT104 stays the single front
+    # door: clients always POST here, and we transparently proxy heavy platforms
+    # to the GPU host and hand back its HLS url. 2D software cores stay local.
+    if not web_url and (platform or '').lower() in GPU_PLATFORMS:
+        return await _proxy_to_gpu(data)
 
     # Reap prior sessions from the same client (e.g. a Roku relaunch) so they
     # don't pile up as orphan Chromium/FFmpeg processes and confuse which
@@ -524,7 +593,10 @@ async def handle_start(req):
 
 
 async def handle_stop(req):
-    s = STREAMS.pop(req.match_info['sid'], None)
+    sid = req.match_info['sid']
+    if GPU_STREAMS.pop(sid, None):
+        return await _proxy_to_gpu_path(sid, '/stop')
+    s = STREAMS.pop(sid, None)
     if s:
         await runner_retroarch.terminate(
             s.get('ffmpeg'), s.get('chrome'), s.get('retroarch'), s.get('xvfb'))
@@ -539,6 +611,8 @@ async def handle_input(req):
     except Exception:
         data = {}
     key, pressed = data.get('key', ''), data.get('pressed', True)
+    if sid in GPU_STREAMS:
+        return await _proxy_to_gpu_path(sid, '/input', data=data)
     s = STREAMS.get(sid)
     if not s:
         return web.json_response({'error': 'stream not found'}, status=404)

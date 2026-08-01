@@ -68,9 +68,14 @@ def test_stream_platform_not_offered_without_its_core(tmp_path):
 
 
 def test_streamable_slugs_reflects_what_is_installed(tmp_path, firmware):
+    # snes9x is a software core, so installing it makes SNES streamable on any
+    # host. Flycast (dc/naomi) is HW-GL: even installed it is NOT streamable on
+    # a GPU-less host, because it would render a black frame — see is_software_core.
+    (tmp_path / 'snes9x_libretro.so').write_bytes(b'')
     (tmp_path / 'flycast_libretro.so').write_bytes(b'')
     got = streamable_slugs(tmp_path, firmware)
-    assert 'dc' in got and 'naomi' in got and 'atomiswave' in got
+    assert 'snes' in got and 'sfam' in got
+    assert 'dc' not in got             # flycast is HW-GL, hidden on no-GPU host
     assert 'ngc' not in got            # dolphin absent
 
 
@@ -167,6 +172,11 @@ def test_streamable_excludes_platforms_missing_firmware(cores, tmp_path):
     system = tmp_path / 'system'
     system.mkdir()
     got = tiers.streamable_slugs(cores, system)
-    assert 'vectrex' in got and 'ngc' in got and 'wii' in got
-    for needs_bios in ('dc', 'ps2', 'intellivision', 'sharp-x68000', 'msx'):
+    # Software, no-firmware cores are streamable.
+    assert 'vectrex' in got and 'snes' in got and 'nes' in got
+    # HW-GL cores are hidden on a GPU-less host even when installed.
+    for hw_gl in ('ngc', 'wii', 'ps2', 'psx', '3ds'):
+        assert hw_gl not in got, hw_gl
+    # Cores needing firmware the host does not have are also hidden.
+    for needs_bios in ('intellivision', 'sharp-x68000', 'msx'):
         assert needs_bios not in got, needs_bios

@@ -21,6 +21,7 @@ from pathlib import Path
 
 from aiohttp import web
 
+import archives
 import runner_retroarch
 import saves
 import tiers
@@ -102,7 +103,14 @@ KEY_MAP = {
 
 
 def resolve_rom(platform: str, rom_name: str) -> Path | None:
-    """Path of a ROM under ROM_BASE; None if missing or traversal attempt."""
+    """Path of a ROM under ROM_BASE; None if missing or traversal attempt.
+
+    Most of this library is archived (100% of wii and arcade, 99% of ps2 and
+    snes). For platforms whose emulator cannot read an archive, this returns the
+    extracted disc image instead of the `.7z` — see archives.playable_path,
+    which caches so the cost is paid once per title, and which deliberately
+    leaves arcade zips alone because there the zip *is* the romset.
+    """
     if not platform or not rom_name:
         return None
     base = Path(ROM_BASE).resolve()
@@ -112,7 +120,11 @@ def resolve_rom(platform: str, rom_name: str) -> Path | None:
         return None
     if not str(p).startswith(str(base)) or not p.is_file():
         return None
-    return p
+    try:
+        return archives.playable_path(platform, p)
+    except Exception:
+        log.exception('archive extraction failed for %s/%s', platform, rom_name)
+        return None
 
 
 # ---------------------------------------------------------------- tier route
@@ -130,8 +142,16 @@ async def handle_streamable(req):
             why = tiers.why_not(slug)
             if why:
                 unavailable[slug] = why
+    # Slugs the *local* tier claims but cannot actually serve, because the
+    # EmulatorJS core was never downloaded. Without this the client happily
+    # returns 'local' for them from its own EJS_CORES table and the game dies at
+    # launch — the local-tier twin of the missing-RetroArch-core dead end.
+    ejs_unavailable = sorted(
+        slug for slug, system in tiers.EJS_CORES.items()
+        if not tiers.ejs_core_installed(system))
     return _cors(web.json_response({'streamable': slugs,
-                                    'unavailable': unavailable}))
+                                    'unavailable': unavailable,
+                                    'ejs_unavailable': ejs_unavailable}))
 
 
 async def handle_route(req):
@@ -401,12 +421,19 @@ async def handle_start(req):
     xvfb = await runner_retroarch.start_xvfb(display_num)
     engine, chrome, ra, cdp_ws = 'retroarch', None, None, ''
 
-    # Prefer EmulatorJS-in-Chromium (SwiftShader software WebGL) whenever the
-    # platform has an EJS core: headless RetroArch's native GL context hangs on
-    # this GPU-less box. Only use RetroArch for heavy systems EJS can't do
-    # (GameCube/Wii/PS2/Saturn/3DS), which have a stream_core but no EJS_CORES.
-    ejs_capable = platform in tiers.EJS_CORES
-    if rom is not None and tiers.stream_core(platform) and not ejs_capable:
+    # This host has no GPU, so the ONLY thing that renders a real frame is a
+    # native RetroArch software core (video_driver=sdl2). EmulatorJS-in-Chromium
+    # was preferred here historically, but its WebGL canvas paints black under
+    # SwiftShader on this box — EJS_emulator.started is true yet every pixel is
+    # zero. So for a local ROM we prefer a native SOFTWARE core whenever one
+    # exists; heavy HW-GL cores (Dolphin/PCSX2/Flycast/Mupen64Plus/Citra/PPSSPP)
+    # are deliberately NOT launched here — they need a real GL context and would
+    # exit with "Cannot open video driver", streaming a black frame. Those heavy
+    # systems fall through to Chromium only as a last resort (still likely black,
+    # but never a hard crash); route()/streamable_slugs already hide them from
+    # clients so users are not offered a platform this host cannot render.
+    core_file = tiers.stream_core(platform) or ''
+    if rom is not None and tiers.is_software_core(core_file):
         try:
             ra = await runner_retroarch.start_retroarch(
                 platform, str(rom), display_num, rom_name)
@@ -671,7 +698,8 @@ async def handle_rtc_offer(req):
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL)).wait()
         ra = await runner_retroarch.start_retroarch(
-            platform, str(rom), display_num, rom_name)
+            platform, str(rom), display_num, rom_name,
+            pad_event=pad.event_node if pad is not None else None)
 
         import webrtc
 

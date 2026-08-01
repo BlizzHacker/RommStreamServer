@@ -37,15 +37,20 @@ def core_path(platform_slug: str, cores_dir: Path = CORES_DIR) -> Path | None:
 
 
 async def start_xvfb(display_num: int):
+    # +extension GLX +render: RetroArch's "gl" video driver needs a GLX visual
+    # to bind llvmpipe (software OpenGL). Without these Xvfb advertises no GLX
+    # and the gl driver cannot create a context — the software 2D cores then
+    # render black. These flags cost nothing for the Chromium/web path.
     proc = await asyncio.create_subprocess_exec(
-        'Xvfb', f':{display_num}', '-screen', '0', '1280x720x24', '-ac',
+        'Xvfb', f':{display_num}', '-screen', '0', '1280x720x24',
+        '+extension', 'GLX', '+render', '-ac',
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
     await asyncio.sleep(1)
     return proc
 
 
 async def start_retroarch(platform_slug: str, rom_path: str, display_num: int,
-                          rom_name: str):
+                          rom_name: str, pad_event: str | None = None):
     core = core_path(platform_slug)
     if core is None or not core.exists():
         raise FileNotFoundError(f'no RetroArch core for {platform_slug}')
@@ -55,18 +60,47 @@ async def start_retroarch(platform_slug: str, rom_path: str, display_num: int,
     # appended config did not take effect, and without a log there is no way to
     # tell "the pad was never bound" from "the core cannot find its firmware" —
     # both look like a session that streams a still image.
-    args = ['retroarch', '-v', '-L', str(core), rom_path, '--fullscreen']
-    if RA_CONFIG.exists():
-        args += ['--appendconfig', str(RA_CONFIG)]
-    env['XDG_RUNTIME_DIR'] = '/tmp'
-    # HOME is deliberately NOT set. The unit provides none, which means RetroArch
-    # never finds ~/.config/retroarch/retroarch.cfg and runs on defaults — and
-    # that is the only configuration in which it runs at all here. Setting
-    # HOME=/root makes it abort with SIGABRT during startup *even with no config
-    # file present*, so the missing HOME is load-bearing rather than an oversight.
     #
-    # The cost is that config-driven settings (notably input_joypad_driver, needed
-    # to bind a virtual pad) cannot be applied yet. See docs/analog-input.md.
+    # dbus-run-session: the historical SIGABRT-on-config was never RetroArch's
+    # config parser. This Debian build links GameMode; applying a config makes
+    # its client library reach for a D-Bus session bus, and when autolaunch
+    # fails (no $DISPLAY on the bus side, container) it calls
+    # dbus_connection_unref(NULL) — an assertion that aborts the process.
+    # Giving it a real (empty) session bus makes that path succeed cleanly.
+    #
+    # -c, not --appendconfig: with no base config to append to (no HOME), 1.14
+    # silently ignores --appendconfig — the earlier binds file was never read
+    # and every session ran on pure defaults.
+    args = ['dbus-run-session', '--',
+            'retroarch', '-v', '-L', str(core), rom_path, '--fullscreen']
+    if RA_CONFIG.exists():
+        args += ['-c', str(RA_CONFIG)]
+    # Software 2D cores render through RetroArch's default "gl" driver, which on
+    # this GPU-less host runs on Mesa's llvmpipe (software OpenGL) — snes9x /
+    # fceumm / gambatte / genesis-plus-gx are light enough that llvmpipe draws
+    # them at full speed (verified: Chrono Trigger's title pendulum). Two things
+    # matter and both are set below via a read-only appendconfig:
+    #   * --set-shader "" (the CLI flag, added to args): a stale GLSL shader
+    #     preset otherwise loads and the frame comes out black.
+    #   * audio_driver = null: there is no audio device, and the default alsa
+    #     driver's failure is loud but harmless; null keeps the log clean.
+    # Do NOT force video_driver = "sdl2" here: on this box sdl2 initialises, then
+    # falls back to the "null" display driver and paints nothing (black). "gl"
+    # on llvmpipe is the path that actually renders. Heavy HW-render cores
+    # (mupen64plus/dolphin/pcsx2/…) still can't run — llvmpipe rejects their FBO
+    # setup — which is why is_software_core() gates what we launch at all.
+    if tiers.is_software_core(core.name):
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        soft_cfg = LOG_DIR / f'soft-{display_num}.cfg'
+        soft_cfg.write_text('audio_driver = "null"\n'
+                            'video_shader_enable = "false"\n')
+        args += ['--set-shader', '', '--appendconfig', str(soft_cfg)]
+    env['XDG_RUNTIME_DIR'] = '/tmp'
+    if pad_event:
+        # SDL2's udev-less fallback opens exactly this node; see vpad.event_node.
+        env['SDL_JOYSTICK_DEVICE'] = pad_event
+    # HOME is still deliberately NOT set: RetroArch must never discover a stray
+    # ~/.config/retroarch config that fights the -c file above.
     # Keep a log per display. Discarding RetroArch's output made "the pad was
     # never bound" and "the core could not find its firmware" both look identical
     # from outside — a silent session that streams a still image.

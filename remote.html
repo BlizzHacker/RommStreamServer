@@ -174,6 +174,7 @@ function sendAxis(side, x, y){
     body:JSON.stringify({stick:side,x:x,y:y})}).catch(function(){});
 }
 function bindHold(el, k){
+  el.setAttribute('data-k', k);   // lets a physical-pad press flash this button
   const dn=function(e){e.preventDefault();send(k,true);};
   const up=function(e){e.preventDefault();send(k,false);};
   el.addEventListener('pointerdown',dn);
@@ -292,27 +293,62 @@ async function poll(){
 }
 setInterval(poll,1500);
 
+// Standard-mapping index -> RetroPad button. Number keys so p.buttons[i] is
+// indexed correctly (a for..in over an object yields string keys, which is what
+// broke some pads).
 const GP_MAP={0:'a',1:'b',2:'x',3:'y',4:'l1',5:'r1',6:'l2',7:'r2',8:'select',9:'start',12:'up',13:'down',14:'left',15:'right'};
+const GP_IDX=Object.keys(GP_MAP).map(Number);
 let gpOn=false; const gpPrev={};
 function setGp(on,name){ gpOn=on; const el=document.getElementById('gp');
-  el.classList.toggle('on',on); el.textContent=on?(name||'controller'):'no pad'; }
-addEventListener('gamepadconnected',function(e){setGp(true,(e.gamepad.id||'').slice(0,18));});
-addEventListener('gamepaddisconnected',function(){const ps=[].slice.call(navigator.getGamepads()).filter(function(p){return p&&p.connected;});setGp(ps.length>0);});
-function gpLoop(){
+  if(!el) return;
+  el.classList.toggle('on',on);
+  // When no pad is seen yet, tell the user HOW to connect one — a paired-but-idle
+  // controller does not appear in navigator.getGamepads() on mobile browsers
+  // until a button is pressed, which is why it looked like it "won't connect".
+  el.textContent = on ? (name||'controller') : 'press Ⓐ to pair pad';
+}
+addEventListener('gamepadconnected',function(e){ setGp(true,(e.gamepad.id||'').slice(0,18)); });
+addEventListener('gamepaddisconnected',function(){
+  const ps=[].slice.call(navigator.getGamepads()).filter(function(p){return p&&p.connected;});
+  setGp(ps.length>0, ps.length?(ps[0].id||'').slice(0,18):'');
+});
+// A first user gesture unblocks the Gamepad API on some browsers; also poll
+// aggressively so a controller connected before the page loaded is still found.
+['pointerdown','keydown','touchstart'].forEach(function(ev){
+  addEventListener(ev, function(){ /* gesture recorded; gpLoop does the rest */ }, {once:false});
+});
+function firstPad(){
   const pads=navigator.getGamepads?navigator.getGamepads():[];
-  const p=[].slice.call(pads).find(function(x){return x&&x.connected;});
+  for(let i=0;i<pads.length;i++){ if(pads[i]&&pads[i].connected) return pads[i]; }
+  return null;
+}
+function gpLoop(){
+  const p=firstPad();
   if(p && !gpOn) setGp(true,(p.id||'').slice(0,18));
-  if(p&&sid){
-    for(const i in GP_MAP){ const btn=p.buttons[i];
+  if(!p && gpOn) setGp(false);
+  if(p){
+    // Buttons: fire on change, regardless of whether a game is live yet (so the
+    // pill lights up the moment you press a button, proving it's connected).
+    for(let k=0;k<GP_IDX.length;k++){
+      const i=GP_IDX[k], btn=p.buttons[i], key=GP_MAP[i];
       const pr=!!(btn&&(btn.pressed||btn.value>0.5));
-      if(pr!==!!gpPrev[GP_MAP[i]]){ gpPrev[GP_MAP[i]]=pr; send(GP_MAP[i],pr); } }
-    const lx=p.axes[0]||0, ly=p.axes[1]||0, rx=p.axes[2]||0, ry=p.axes[3]||0;
-    const lAct=(Math.abs(lx)>0.08||Math.abs(ly)>0.08);
-    if(lAct||gpPrev._lx){ sendAxis('left',+lx.toFixed(2),+ly.toFixed(2)); gpPrev._lx=lAct; }
-    const rAct=(Math.abs(rx)>0.08||Math.abs(ry)>0.08);
-    if(rAct||gpPrev._rx){ sendAxis('right',+rx.toFixed(2),+ry.toFixed(2)); gpPrev._rx=rAct; }
+      if(pr!==!!gpPrev[key]){ gpPrev[key]=pr; if(sid) send(key,pr); flashBtn(key,pr); }
+    }
+    if(sid){
+      const lx=p.axes[0]||0, ly=p.axes[1]||0, rx=p.axes[2]||0, ry=p.axes[3]||0;
+      const lAct=(Math.abs(lx)>0.08||Math.abs(ly)>0.08);
+      if(lAct||gpPrev._lx){ sendAxis('left',+lx.toFixed(2),+ly.toFixed(2)); gpPrev._lx=lAct; }
+      const rAct=(Math.abs(rx)>0.08||Math.abs(ry)>0.08);
+      if(rAct||gpPrev._rx){ sendAxis('right',+rx.toFixed(2),+ry.toFixed(2)); gpPrev._rx=rAct; }
+    }
   }
   requestAnimationFrame(gpLoop);
+}
+// Light the matching on-screen button when a physical pad button is pressed, so
+// it's visually obvious the controller is working even before a game starts.
+function flashBtn(key,on){
+  const b=document.querySelector('[data-k="'+key+'"]');
+  if(b){ if(on) b.classList.add('hit'); else b.classList.remove('hit'); }
 }
 requestAnimationFrame(gpLoop);
 

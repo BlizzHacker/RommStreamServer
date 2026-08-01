@@ -1,8 +1,5 @@
 # RomM Stream Server
 
-A project of the [Move Weight Foundation](https://foundation.moveweight.com), an
-Oklahoma non-profit corporation with 501(c)(3) status pending.
-
 The shared game-play backend for a [RomM](https://github.com/rommapp/romm)
 library: it runs the emulator server-side and delivers the picture to devices
 that can't emulate for themselves. A Roku gets a low-latency HLS stream with

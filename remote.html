@@ -119,22 +119,25 @@ main{flex:1;position:relative;display:flex;align-items:center;justify-content:sp
 
 <script>
 const CFG = { client: "__CLIENT__", base: "" };
-let sid = "", connected = false;
+let sid = "", connected = false, curName = "";
 
-function setStatus(txt, on){ document.getElementById('status').firstChild.nextSibling.textContent = txt;
-  document.getElementById('conn').classList.toggle('on', !!on); }
-setStatus = (txt,on)=>{ const s=document.getElementById('status');
-  s.innerHTML = '<span class="dot'+(on?' on':'')+'" id="conn"></span>'+txt+'<span class="pad'+(gpOn?' on':'')+'" id="gp"></span>'; };
+/* single source of truth for the status bar (game + gamepad state) */
+function render(){
+  const s=document.getElementById('status');
+  const game = connected ? ('game: '+(curName||sid)) : 'waiting for a game…';
+  const pad = gpOn ? ('<span style="color:#4ADE80;margin-left:8px">🎮 '+String(gpName||'Controller').slice(0,20)+'</span>') : '';
+  s.innerHTML = '<span class="dot'+(connected?' on':'')+'"></span>'+game+pad;
+}
 
 /* ---- find the active session for this client ---- */
 async function poll(){
   try{
     const r = await fetch('/api/stream/status'); const j = await r.json();
-    // prefer a stream whose client matches; else the newest
     let s = (j.streams||[]).find(x=>x.client===CFG.client) || (j.streams||[])[0];
-    if(s){ if(sid!==s.id){ sid=s.id; connected=true; setStatus('connected: '+(s.name||s.id),true);} }
-    else { connected=false; sid=""; setStatus('waiting for a game…',false); }
-  }catch(e){ connected=false; setStatus('server offline',false); }
+    if(s){ sid=s.id; connected=true; curName=s.name||s.id; }
+    else { connected=false; sid=""; curName=""; }
+  }catch(e){ connected=false; }
+  render();
 }
 setInterval(poll, 2000); poll();
 
@@ -179,26 +182,31 @@ function mouse(action,dx,dy){ if(!sid)return;
 
 document.getElementById('btn-pair').onclick=poll;
 
-/* ---- Gamepad API: read connected Xbox controllers ---- */
-let gpOn=false;
-const GP_MAP = {0:'a',1:'b',2:'x',3:'y',4:'l1',5:'r1',8:'select',9:'start',12:'up',13:'down',14:'left',15:'right'};
+/* ---- Gamepad API: read a connected Xbox controller on this device ---- */
+let gpOn=false, gpName='';
+// Standard mapping (Xbox): A B X Y LB RB LT RT Back Start LS RS Up Down Left Right
+const GP_MAP = {0:'a',1:'b',2:'x',3:'y',4:'l1',5:'r1',6:'l2',7:'r2',8:'select',9:'start',12:'up',13:'down',14:'left',15:'right'};
 const gpPrev={};
-window.addEventListener('gamepadconnected',()=>{gpOn=true;});
-window.addEventListener('gamepaddisconnected',()=>{gpOn=[...navigator.getGamepads()].some(p=>p&&p.connected);});
+window.addEventListener('gamepadconnected',e=>{gpOn=true;gpName=e.gamepad.id||'Controller';render();});
+window.addEventListener('gamepaddisconnected',()=>{const ps=[...navigator.getGamepads()].filter(p=>p&&p.connected);gpOn=ps.length>0;if(!gpOn)gpName='';render();});
+function flash(k){ const b=document.querySelector('[data-k="'+k+'"]'); if(b){b.classList.add('hit');setTimeout(()=>b.classList.remove('hit'),90);} }
 function gpLoop(){
   const pads=navigator.getGamepads?navigator.getGamepads():[];
   const p=[...pads].find(x=>x&&x.connected);
-  gpOn=!!p; document.getElementById('gp')&&document.getElementById('gp').classList.toggle('on',gpOn);
+  const nowOn=!!p;
+  if(nowOn&&p.id!==gpName){gpName=p.id;render();}
+  if(nowOn!==gpOn){gpOn=nowOn;render();}
   if(p&&sid){
     for(const [i,k] of Object.entries(GP_MAP)){
-      const pressed=!!(p.buttons[i]&&p.buttons[i].pressed);
-      if(pressed!==!!gpPrev[k]){ gpPrev[k]=pressed; send(k,pressed); }
+      const btn=p.buttons[i];
+      const pressed=!!(btn&&(btn.pressed||btn.value>0.5));
+      if(pressed!==!!gpPrev[k]){ gpPrev[k]=pressed; send(k,pressed); if(pressed)flash(k); }
     }
-    // left stick -> dpad
+    // left stick -> dpad (for menus/movement)
     const ax=p.axes[0]||0, ay=p.axes[1]||0, DZ=0.5;
     const dirs={left:ax<-DZ,right:ax>DZ,up:ay<-DZ,down:ay>DZ};
     for(const [d,v] of Object.entries(dirs)){
-      if(v!==!!gpPrev['ax'+d]){ gpPrev['ax'+d]=v; send(d,v); }
+      if(v!==!!gpPrev['ax'+d]){ gpPrev['ax'+d]=v; send(d,v); if(v)flash(d); }
     }
   }
   requestAnimationFrame(gpLoop);

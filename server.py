@@ -228,6 +228,32 @@ async def _cdp_eval(ws, expr, await_promise=False):
             return m.get('result', {}).get('result', {}).get('value')
 
 
+def _romm_api_login(base, user, password):
+    """Log into RomM via its API and return session cookies as CDP setCookie
+    params. RomM 4.9 login = POST /api/login with HTTP Basic auth + the
+    x-csrftoken header (value from the romm_csrftoken cookie)."""
+    import base64 as _b64
+    import http.cookiejar
+    from urllib.request import build_opener, HTTPCookieProcessor, Request
+    from urllib.parse import urlparse
+    host = urlparse(base).hostname or 'localhost'
+    jar = http.cookiejar.CookieJar()
+    opener = build_opener(HTTPCookieProcessor(jar))
+    opener.open(base + '/api/heartbeat', timeout=6).read()  # prime CSRF cookie
+    csrf = next((c.value for c in jar if c.name == 'romm_csrftoken'), '')
+    creds = _b64.b64encode(f'{user}:{password}'.encode()).decode()
+    req = Request(base + '/api/login', data=b'', method='POST')
+    req.add_header('Authorization', 'Basic ' + creds)
+    if csrf:
+        req.add_header('x-csrftoken', csrf)
+    opener.open(req, timeout=6).read()  # sets romm_session
+    out = []
+    for c in jar:
+        out.append({'name': c.name, 'value': c.value, 'domain': host,
+                    'path': c.path or '/', 'httpOnly': False, 'secure': False})
+    return out
+
+
 async def romm_autoplay(cdp_ws, base, rom_id, user, password):
     """Drive RomM's web UI: login if on the login page, then click EJS Play."""
     import websocket
@@ -257,46 +283,47 @@ async def romm_autoplay(cdp_ws, base, rom_id, user, password):
             if m.get('id') == 1:
                 return m.get('result', {}).get('result', {}).get('value')
 
+    def cmd(method, params, mid=7):
+        ws.send(json.dumps({'id': mid, 'method': method, 'params': params}))
+        while True:
+            m = json.loads(ws.recv())
+            if m.get('id') == mid:
+                return m
+
     try:
-        # If we landed on the login page, fill + submit.
-        for _ in range(20):
-            url = ev('location.href') or ''
-            if '/login' in url and user:
-                fill = ('(function(){function s(el,v){var d=Object.'
-                        'getOwnPropertyDescriptor(HTMLInputElement.prototype,'
-                        '"value").set;d.call(el,v);el.dispatchEvent(new Event('
-                        '"input",{bubbles:true}));el.dispatchEvent(new Event('
-                        '"change",{bubbles:true}));}var u=document.querySelector('
-                        '"input[name=username],input[type=text]");var p='
-                        'document.querySelector("input[type=password]");'
-                        'if(u&&p){s(u,%r);s(p,%r);var b=[...document.'
-                        'querySelectorAll("button")].find(b=>/login/i.test('
-                        'b.innerText)&&!/authentik/i.test(b.innerText));'
-                        'if(b){b.click();return "submitted";}}return "waiting";'
-                        '})()') % (user, password)
-                ev(fill)
-                await asyncio.sleep(4)
-            elif ('/rom/' in url) or (user == ''):
-                break
-            else:
-                await asyncio.sleep(0.5)
-        # Dismiss Chrome's "save password?" bubble (browser UI, not DOM) by
-        # sending Escape via CDP so it can't cover the Play button.
-        try:
-            for t in ('keyDown', 'keyUp'):
-                ws.send(json.dumps({'id': 9, 'method': 'Input.dispatchKeyEvent',
-                    'params': {'type': t, 'key': 'Escape', 'code': 'Escape',
-                               'windowsVirtualKeyCode': 27}}))
-                while True:
-                    m = json.loads(ws.recv())
-                    if m.get('id') == 9:
-                        break
-        except Exception:
-            pass
-        # Ensure we're on the EJS launcher, then click Play.
+        # Log in via RomM's API and inject the session cookie with CDP, so no
+        # login FORM is ever submitted -> Chrome never shows a save-password
+        # bubble (which otherwise covers half the game).
+        if user:
+            try:
+                cmd('Network.enable', {})
+                sess = _romm_api_login(base, user, password)
+                for c in sess:
+                    cmd('Network.setCookie', c, mid=8)
+            except Exception:
+                pass
+        # Go straight to the EJS launcher (now authenticated by the cookie).
+        ev('window.location.assign(%r)' % f'{base}/rom/{rom_id}/ejs')
+        await asyncio.sleep(3)
         cur = ev('location.href') or ''
-        if f'/rom/{rom_id}/ejs' not in cur:
+        # Fallback: if the cookie login didn't take and we're on /login, do the
+        # form login once.
+        if '/login' in cur and user:
+            fill = ('(function(){function s(el,v){var d=Object.'
+                    'getOwnPropertyDescriptor(HTMLInputElement.prototype,'
+                    '"value").set;d.call(el,v);el.dispatchEvent(new Event('
+                    '"input",{bubbles:true}));el.dispatchEvent(new Event('
+                    '"change",{bubbles:true}));}var u=document.querySelector('
+                    '"input[name=username],input[type=text]");var p='
+                    'document.querySelector("input[type=password]");'
+                    'if(u&&p){s(u,%r);s(p,%r);var b=[...document.'
+                    'querySelectorAll("button")].find(b=>/login/i.test('
+                    'b.innerText)&&!/authentik/i.test(b.innerText));'
+                    'if(b){b.click();}}return "x";})()') % (user, password)
+            ev(fill)
+            await asyncio.sleep(4)
             ev('window.location.assign(%r)' % f'{base}/rom/{rom_id}/ejs')
+            await asyncio.sleep(2)
         for _ in range(30):
             r = ev('(function(){var b=[...document.querySelectorAll("button")]'
                    '.find(b=>b.innerText.trim()==="Play");if(b){b.click();'
@@ -413,8 +440,8 @@ async def handle_start(req):
             '--disable-infobars', '--hide-crash-restore-bubble',
             '--disable-features=InfiniteSessionRestore,Translate,'
             'PasswordManagerOnboarding,AutofillEnableAccountWalletStorage,'
-            'PasswordManager,PasswordGeneration,AutofillServerCommunication',
-            '--disable-save-password-bubble',
+            'PasswordManager,PasswordGeneration,AutofillServerCommunication,'
+            'PasswordLeakDetection,AutofillEnablePasswordManager',
             '--password-store=basic',
             '--remote-debugging-port=' + str(debug_port),
             # Chromium >=111 rejects CDP WebSocket connections (403) unless the

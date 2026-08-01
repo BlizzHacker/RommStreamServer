@@ -1,5 +1,7 @@
 # RomM Stream Server
 
+> A **[Cartridge](https://github.com/BlizzHacker/rom-hub/blob/master/BRAND.md)** app by MoveWeight — the play pillar. Cartridge is a self-hosted retro-gaming ecosystem. Unofficial; not affiliated with RomM, Gaseous or Retrom.
+
 The shared game-play backend for a [RomM](https://github.com/rommapp/romm)
 library: it runs the emulator server-side and delivers the picture to devices
 that can't emulate for themselves. A Roku gets a low-latency HLS stream with

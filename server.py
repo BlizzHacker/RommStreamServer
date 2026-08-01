@@ -510,7 +510,7 @@ async def handle_start(req):
                     'ffmpeg': ffmpeg, 'display_num': display_num,
                     'engine': engine, 'rom_name': display_name,
                     'cdp_ws': cdp_ws, 'web': bool(web_url), 'client': client,
-                    'ejs': bool(romm_rom_id)}
+                    'ejs': bool(romm_rom_id), 'platform': platform}
     # Point clients at the master playlist (Roku requires #EXT-X-STREAM-INF).
     # RetroArch/HLS-only sessions without a master fall back to the media list.
     return web.json_response({
@@ -564,10 +564,45 @@ async def handle_input(req):
     return web.json_response({'ok': True, 'key': key, 'mapped': code})
 
 
+async def handle_analog(req):
+    """Analog-stick input from the phone remote / a physical controller.
+
+    Body: {stick: 'left'|'right', x: -1..1, y: -1..1}. For a RetroArch session
+    we translate the left stick past a deadzone into d-pad key presses (via the
+    same xdotool path as digital input), which is what the software 2D cores this
+    host runs actually need — none of them read true analog. True analog would
+    require the uinput vpad (see vpad.py) wired into the HLS session; the cores
+    offered here don't use it, so this keeps the contract without pretending.
+    """
+    sid = req.match_info['sid']
+    s = STREAMS.get(sid)
+    if not s:
+        return web.json_response({'error': 'stream not found'}, status=404)
+    try:
+        d = await req.json()
+    except Exception:
+        d = {}
+    stick = d.get('stick', 'left')
+    x, y = float(d.get('x', 0) or 0), float(d.get('y', 0) or 0)
+    # Only the left stick drives movement here; right stick is a no-op for these
+    # 2D cores. Track per-session which dpad keys the stick is currently holding
+    # so we release them cleanly when it recenters.
+    if stick != 'left' or s['engine'] != 'retroarch':
+        return web.json_response({'ok': True, 'noop': True})
+    DZ = 0.5
+    want = {'left': x < -DZ, 'right': x > DZ, 'up': y < -DZ, 'down': y > DZ}
+    holds = s.setdefault('_axis_holds', {})
+    for k, on in want.items():
+        if bool(holds.get(k)) != on:
+            holds[k] = on
+            await runner_retroarch.send_key(s['display_num'], k, on)
+    return web.json_response({'ok': True})
+
+
 async def handle_status(req):
     return web.json_response({'streams': [
         {'id': k, 'name': v['rom_name'], 'engine': v['engine'],
-         'client': v.get('client', '')}
+         'client': v.get('client', ''), 'platform': v.get('platform', '')}
         for k, v in STREAMS.items()]})
 
 
@@ -637,7 +672,13 @@ async def handle_remote(req):
     global REMOTE_HTML
     if REMOTE_HTML is None:
         try:
-            REMOTE_HTML = (Path(__file__).parent / 'remote.html').read_text()
+            html_src = (Path(__file__).parent / 'remote.html').read_text()
+            # Inline layouts.js so the remote is a single self-contained document
+            # (no second request, and it works even if a static route isn't set).
+            layouts = (Path(__file__).parent / 'layouts.js').read_text()
+            REMOTE_HTML = html_src.replace(
+                '<script src="layouts.js"></script>',
+                '<script>\n' + layouts + '\n</script>')
         except Exception:
             return web.json_response({'error': 'remote unavailable'}, status=500)
     app_id = req.query.get('app', 'game')
@@ -804,6 +845,7 @@ def build_app() -> web.Application:
     r.add_post('/api/stream/start', handle_start)
     r.add_post('/api/stream/{sid}/stop', handle_stop)
     r.add_post('/api/stream/{sid}/input', handle_input)
+    r.add_post('/api/stream/{sid}/analog', handle_analog)
     r.add_post('/api/stream/{sid}/text', handle_text)
     r.add_post('/api/stream/{sid}/mouse', handle_mouse)
     r.add_get('/api/stream/status', handle_status)

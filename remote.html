@@ -350,6 +350,7 @@ function flashBtn(key,on){
   const b=document.querySelector('[data-k="'+key+'"]');
   if(b){ if(on) b.classList.add('hit'); else b.classList.remove('hit'); }
 }
+setGp(false);   // show the 'press Ⓐ to pair pad' prompt immediately on load
 requestAnimationFrame(gpLoop);
 
 const kb=document.getElementById('kb'), mouse=document.getElementById('mouse');

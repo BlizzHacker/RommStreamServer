@@ -222,10 +222,14 @@ async def start_ffmpeg_hls(display: str, stream_dir: Path):
         '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
         '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
         '-profile:v', 'high', '-level', '4.0', '-pix_fmt', 'yuv420p',
-        '-b:v', '3M', '-maxrate', '3M', '-bufsize', '6M',
-        '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
+        '-b:v', '3M', '-maxrate', '3M', '-bufsize', '2M',
+        # 1-second GOP so every segment starts on a keyframe and the player can
+        # begin almost immediately. Was a 2s GOP + 6-segment window = up to ~12 s
+        # of buffered latency (the "large delay"); 1s segments with a 3-deep
+        # window cut worst-case latency to ~3-4 s, about as low as HLS goes.
+        '-g', '30', '-keyint_min', '30', '-sc_threshold', '0',
         '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
-        '-hls_time', '2', '-hls_list_size', '6',
+        '-hls_time', '1', '-hls_list_size', '3',
         '-hls_flags', 'delete_segments+independent_segments',
         # Roku's HLS player expects a MASTER playlist with #EXT-X-STREAM-INF,
         # not a bare media playlist; without it playback fails with a vague
@@ -549,19 +553,41 @@ async def handle_input(req):
         code, char = WEB_KEY_MAP.get(key, (key, key))
     else:
         code = char = KEY_MAP.get(key, key)
-    try:
-        import websocket
-        ws_url = s.get('cdp_ws', '').replace('localhost', '127.0.0.1')
-        if ws_url:
-            page_ws = websocket.create_connection(ws_url, timeout=2)
-            page_ws.send(json.dumps({'id': 1, 'method': 'Input.dispatchKeyEvent',
-                                     'params': {'type': 'keyDown' if pressed else 'keyUp',
-                                                'key': char, 'code': code,
-                                                'windowsVirtualKeyCode': 0}}))
-            page_ws.close()
-    except Exception:
-        pass
+    _cdp_key(s, char, code, pressed)
     return web.json_response({'ok': True, 'key': key, 'mapped': code})
+
+
+def _cdp_key(s, char, code, pressed):
+    """Dispatch a key over the session's PERSISTENT CDP websocket.
+
+    Opening a fresh CDP websocket per keypress (the old behaviour) added a TCP
+    connect + WS handshake — 50-200 ms — to every button, which is what made the
+    controls feel laggy. We keep one connection per session in s['cdp_conn'] and
+    only reconnect if a send fails.
+    """
+    import websocket
+    ws_url = s.get('cdp_ws', '').replace('localhost', '127.0.0.1')
+    if not ws_url:
+        return
+    msg = json.dumps({'id': 1, 'method': 'Input.dispatchKeyEvent', 'params': {
+        'type': 'keyDown' if pressed else 'keyUp',
+        'key': char, 'code': code, 'windowsVirtualKeyCode': 0}})
+    conn = s.get('cdp_conn')
+    for attempt in (0, 1):
+        try:
+            if conn is None:
+                conn = websocket.create_connection(ws_url, timeout=2)
+                conn.settimeout(0.4)      # never block the request on a slow send
+                s['cdp_conn'] = conn
+            conn.send(msg)
+            return
+        except Exception:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+            conn = s['cdp_conn'] = None   # force a reconnect on the next attempt
 
 
 async def handle_analog(req):

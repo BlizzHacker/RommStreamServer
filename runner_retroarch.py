@@ -89,12 +89,27 @@ async def start_retroarch(platform_slug: str, rom_path: str, display_num: int,
     # on llvmpipe is the path that actually renders. Heavy HW-render cores
     # (mupen64plus/dolphin/pcsx2/…) still can't run — llvmpipe rejects their FBO
     # setup — which is why is_software_core() gates what we launch at all.
+    # system_directory, always, and this is a correctness fix rather than
+    # tidiness. Nothing set it, so RetroArch fell back to a RELATIVE
+    # "retroarch/system" — resolved against whatever the process happened to be
+    # started in — while tiers.bios_missing() checks SYSTEM_DIR
+    # (/opt/romm-stream/system). The gate and the emulator were reading
+    # different directories, so a platform could pass the firmware check and
+    # still boot to its own "BIOS not found" screen.
+    #
+    # Which is exactly what it did: with exec.bin and grom.bin in place,
+    # /api/play/route said {"tier":"stream"} for intellivision and the session
+    # drew "LOAD EXEC FAIL / LOAD GROM FAIL / INTELLIVISION HALTED" at a
+    # perfectly healthy frame rate. That is the failure the firmware gate
+    # exists to prevent, arrived at through the gate itself.
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    extra = [f'system_directory = "{tiers.SYSTEM_DIR}"']
     if tiers.is_software_core(core.name):
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        soft_cfg = LOG_DIR / f'soft-{display_num}.cfg'
-        soft_cfg.write_text('audio_driver = "null"\n'
-                            'video_shader_enable = "false"\n')
-        args += ['--set-shader', '', '--appendconfig', str(soft_cfg)]
+        extra += ['audio_driver = "null"', 'video_shader_enable = "false"']
+        args += ['--set-shader', '']
+    cfg = LOG_DIR / f'extra-{display_num}.cfg'
+    cfg.write_text('\n'.join(extra) + '\n')
+    args += ['--appendconfig', str(cfg)]
     env['XDG_RUNTIME_DIR'] = '/tmp'
     if pad_event:
         # SDL2's udev-less fallback opens exactly this node; see vpad.event_node.

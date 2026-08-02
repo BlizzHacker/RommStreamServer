@@ -85,6 +85,13 @@ RETROARCH_CORES = {
     'satellaview': 'snes9x_libretro.so', 'sufami-turbo': 'snes9x_libretro.so',
     'gb': 'gambatte_libretro.so', 'gbc': 'gambatte_libretro.so',
     'gba': 'mgba_libretro.so',
+    # Neo Geo CD. Its own core, not FBNeo: the AES/MVS drivers in fbneo are
+    # cartridge hardware and will not load a cue or a chd. NeoCD declares
+    # `cue|chd` (read from the core itself via retro_get_system_info) and has
+    # no GL symbols at all -- 0, the same as genesis_plus_gx, against 1,258 in
+    # flycast -- so it renders in software and runs on this GPU-less host.
+    'neo-geo-cd': 'neocd_libretro.so',
+    'neogeocd': 'neocd_libretro.so',
     'genesis-slash-megadrive': 'genesis_plus_gx_libretro.so',
     'genesis': 'genesis_plus_gx_libretro.so',
     'sega-mega-drive': 'genesis_plus_gx_libretro.so',
@@ -104,6 +111,7 @@ RETROARCH_CORES = {
 # Mupen64Plus-Next, Citra, PPSSPP, mednafen-psx-HW) and renders BLACK here, so
 # route() must refuse it on a GPU-less host rather than stream a black frame.
 SOFTWARE_CORES = {
+    'neocd_libretro.so',
     'fceumm_libretro.so', 'snes9x_libretro.so', 'gambatte_libretro.so',
     'mgba_libretro.so', 'genesis_plus_gx_libretro.so', 'picodrive_libretro.so',
     'bluemsx_libretro.so', 'vecx_libretro.so', 'freeintv_libretro.so',
@@ -147,6 +155,18 @@ CORE_BIOS: dict[str, list[list[str]]] = {
     'ppsspp_libretro.so': [['PPSSPP/ppge_atlas.zim', 'ppsspp/ppge_atlas.zim']],
     'mednafen_psx_hw_libretro.so': [['scph5500.bin', 'scph5501.bin',
                                      'scph5502.bin', 'scph1001.bin']],
+    # Neo Geo CD needs one system BIOS and one LO ROM, and each has several
+    # accepted names -- front loader, top loader, CDZ, and the UniBIOS. Listed
+    # as two requirements with alternatives rather than twelve requirements,
+    # because any one name in each group satisfies it. Taken from the core's
+    # own info file (12 firmware entries under `neocd/`).
+    'neocd_libretro.so': [
+        ['neocd/neocd_f.rom', 'neocd/neocd_sf.rom', 'neocd/front-sp1.bin',
+         'neocd/neocd_t.rom', 'neocd/neocd_st.rom', 'neocd/top-sp1.bin',
+         'neocd/neocd_z.rom', 'neocd/neocd_sz.rom', 'neocd/neocd.bin',
+         'neocd/uni-bioscd.rom'],
+        ['neocd/ng-lo.rom', 'neocd/000-lo.lo'],
+    ],
     # No firmware needed: Dolphin, Citra, Mupen64Plus-Next, Vecx. FBNeo wants
     # per-game BIOS zips that live with the ROMs, not here.
 }

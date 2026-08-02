@@ -185,6 +185,19 @@ async def handle_route(req):
     slug = req.query.get('platform', '')
     tier = tiers.route(slug)
     if tier is None:
+        # Before refusing, ask the GPU host — the same fold-in
+        # handle_streamable does.
+        #
+        # tiers.route() reads THIS host's cores and system directory, and the
+        # heavy 3D platforms are deliberately not rendered here: they are
+        # proxied. So the local answer for dc, ps2, wii and ngc is "no core"
+        # or "needs firmware" while the GPU host has both and streams them
+        # perfectly well. Two endpoints on one server were giving opposite
+        # answers about the same platform, and this is the one clients ask
+        # about a single title — so a Dreamcast game the stack can play was
+        # reported unplayable at exactly the moment somebody asked for it.
+        if slug and slug.lower() in set(await _gpu_streamable()):
+            return _cors(web.json_response({'tier': 'stream', 'via': 'gpu'}))
         # Say which of the several reasons it is: "no core exists" and "you need
         # to supply firmware" are very different problems for the operator.
         return _cors(web.json_response(

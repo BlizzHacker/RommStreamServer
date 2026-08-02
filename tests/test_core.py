@@ -9,12 +9,18 @@ from saves import save_path
 
 
 @pytest.fixture
-def firmware(tmp_path):
+def firmware(tmp_path, monkeypatch):
     """A system directory satisfying every core's firmware requirement.
 
     Routing is firmware-aware, so tests about core availability have to supply
     this or they are really testing the BIOS gate by accident.
+
+    Checksum verification is disabled here, and deliberately: these files are
+    empty stand-ins, so any published MD5 would reject them and every routing
+    test would silently become a checksum test. `test_a_wrong_dump_is_not_a
+    _present_dump` covers that behaviour on its own.
     """
+    monkeypatch.setattr(tiers, 'BIOS_MD5', {})
     root = tmp_path / 'firmware'
     root.mkdir()
     for reqs in tiers.CORE_BIOS.values():
@@ -180,3 +186,41 @@ def test_streamable_excludes_platforms_missing_firmware(cores, tmp_path):
     # Cores needing firmware the host does not have are also hidden.
     for needs_bios in ('intellivision', 'sharp-x68000', 'msx'):
         assert needs_bios not in got, needs_bios
+
+
+def test_a_wrong_dump_is_not_a_present_dump(tmp_path):
+    """A file that exists but is the wrong dump fails exactly like a missing
+    one -- error screen at a healthy 30fps -- while passing an existence check.
+
+    That is strictly worse than missing: the operator has done the work and
+    has no signal that it did not take. Where the emulator project publishes a
+    checksum, use it.
+    """
+    root = tmp_path / 'firmware'
+    (root / 'keropi').mkdir(parents=True)
+    (root / 'keropi' / 'iplrom.dat').write_bytes(b'not the real dump')
+    (root / 'keropi' / 'cgrom.dat').write_bytes(b'nor this one')
+
+    gaps = tiers.bios_missing('px68k_libretro.so', system_dir=root)
+
+    assert len(gaps) == 2
+    assert all('checksum does not match' in g for g in gaps), gaps
+    assert all(str(root) in g for g in gaps), 'say where it looked'
+
+
+def test_firmware_without_a_published_checksum_is_accepted_on_existence(tmp_path):
+    """Most firmware has no published MD5. Those must keep working on
+    existence alone, or adding this check would break every platform it does
+    not have a checksum for."""
+    root = tmp_path / 'firmware'
+    root.mkdir()
+    (root / 'exec.bin').write_bytes(b'x')
+    (root / 'grom.bin').write_bytes(b'y')
+
+    assert tiers.bios_missing('freeintv_libretro.so', system_dir=root) == []
+
+
+def test_the_published_checksums_are_the_ones_libretro_documents():
+    """Vendored from somebody else's docs, so state which values they are."""
+    assert tiers.BIOS_MD5['keropi/iplrom.dat'] == '7fd4caabac1d9169e289f0f7bbf71d8e'
+    assert tiers.BIOS_MD5['keropi/cgrom.dat'] == 'cb0a5cfcf7247a7eab74bb2716260269'

@@ -5,6 +5,7 @@ Tier "stream" = server-side RetroArch captured and streamed (WebRTC or HLS).
 None          = not playable (Windows/installer/mobile platforms).
 """
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -172,14 +173,57 @@ CORE_BIOS: dict[str, list[list[str]]] = {
 }
 
 
+# Known-good MD5s for firmware where the emulator project publishes one, so a
+# wrong or truncated dump is caught here instead of at the point of play.
+#
+# This gate already exists because a core with no firmware does not fail
+# loudly -- it draws an error screen and streams it at a healthy 30 fps. A
+# file that is PRESENT but wrong fails exactly the same way while also passing
+# the existence check, which is strictly worse: the operator has done the work
+# and has no signal that the dump is bad.
+#
+# Only checksums published by the emulator project are listed. Anything absent
+# here is checked for existence alone, which is the current behaviour and stays
+# correct.
+BIOS_MD5 = {
+    'keropi/iplrom.dat': '7fd4caabac1d9169e289f0f7bbf71d8e',
+    'keropi/cgrom.dat': 'cb0a5cfcf7247a7eab74bb2716260269',
+}
+
+
+def bios_wrong(path: Path, relative: str) -> bool:
+    """Whether a present firmware file does not match its published MD5."""
+    expected = BIOS_MD5.get(relative)
+    if not expected:
+        return False
+    try:
+        digest = hashlib.md5(path.read_bytes()).hexdigest()
+    except OSError:
+        return True
+    return digest != expected
+
+
 def bios_missing(core_filename: str,
                  system_dir: Path | None = None) -> list[str]:
-    """Firmware requirements this core does not have satisfied."""
+    """Firmware requirements this core does not have satisfied.
+
+    A file that is present but does not match its published checksum counts as
+    missing, and says so differently -- "supply this file" and "the file you
+    supplied is not the right dump" send an operator to completely different
+    places.
+    """
     root = system_dir or SYSTEM_DIR
     gaps = []
     for alternatives in CORE_BIOS.get(core_filename, []):
-        if not any((root / a).exists() for a in alternatives):
+        present = [a for a in alternatives if (root / a).exists()]
+        if not present:
             gaps.append(' or '.join(alternatives))
+            continue
+        bad = [a for a in present if bios_wrong(root / a, a)]
+        if bad and len(bad) == len(present):
+            gaps.append(
+                f"{' or '.join(bad)} (present in {root}, but the checksum does "
+                f"not match the published dump)")
     return gaps
 
 

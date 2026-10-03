@@ -1,0 +1,91 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+language: en-US
+tone_instructions: >-
+  Be direct; skip praise and preamble. This streams emulated sessions to
+  remote clients. Prioritize session isolation, signaling correctness, and
+  resource cleanup over style.
+early_access: false
+enable_free_tier: true
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  collapse_walkthrough: true
+  changed_files_summary: true
+  sequence_diagrams: true
+  estimate_code_review_effort: true
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+  suggested_labels: true
+  auto_apply_labels: false
+  suggested_reviewers: false
+  in_progress_fortune: false
+  poem: false
+  enable_prompt_for_ai_agents: true
+  abort_on_close: true
+
+  slop_detection:
+    enabled: true
+    label: slop
+
+  path_filters:
+    - "!**/*.min.js"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/node_modules/**"
+    - "!**/*.lock"
+    - "!**/vendor/**"
+    - "!**/__pycache__/**"
+
+  path_instructions:
+    - path: "**/*.py"
+      instructions: >-
+        Streaming sessions hold real processes and sockets. Flag any path that
+        can leak a child process, a socket, or a temp directory when a client
+        disconnects mid-session, and any session map that grows without
+        eviction.
+
+        Sessions must be isolated: flag anything that lets one client's request
+        address, resume, or terminate another client's session by guessable id.
+
+        A core with no firmware still streams happily — it just streams its own
+        error screen at a healthy frame rate. Health checks that only measure
+        stream liveness therefore report success on a broken session; flag
+        readiness logic that cannot distinguish the two.
+    - path: ".github/workflows/**"
+      instructions: >-
+        Check for unpinned third-party actions, secrets exposed to
+        pull_request_target, and steps interpolating untrusted PR text into run
+        blocks.
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    ignore_usernames:
+      - dependabot
+      - dependabot[bot]
+
+  tools:
+    ruff:
+      enabled: true
+    gitleaks:
+      enabled: true
+    semgrep:
+      enabled: true
+    actionlint:
+      enabled: true
+    languagetool:
+      enabled: false
+
+chat:
+  art: false
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  learnings:
+    scope: auto
